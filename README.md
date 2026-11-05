@@ -6,6 +6,8 @@ and what to do about it — in plain words.**
 It's made for everyday use, and especially for travel: hotel, café and airport
 Wi-Fi, coworking spaces, mobile hotspots.
 
+![nwsolver showing why the internet is slow: a BROKEN verdict with the measured speed, latency and loss, plus what to do](docs/screenshot.png)
+
 ## What it does
 
 Open it like any other app. Within a few seconds it explains one of three things:
