@@ -19,7 +19,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from nwsolver.diag import net
+from nwsolver import __version__
+from nwsolver.diag import clock, net, portal
 from nwsolver.diag.verdict import Verdict
 from nwsolver.engine.checks import Check, CheckResult, Ctx, Status
 
@@ -29,7 +30,7 @@ SUITE_DESC = "Checks why a specific website or service does not open."
 PARALLEL = False
 
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like "
-       "Gecko) Chrome/126.0 Safari/537.36 nwsolver/0.2")
+       "Gecko) Chrome/126.0 Safari/537.36 nwsolver/" + __version__)
 
 
 def _r(cid, title, status, summary, fix="", raw="", **metrics):
@@ -123,6 +124,14 @@ def check_baseline(ctx: Ctx) -> CheckResult:
         return _r(cid, title, Status.ERROR, t.error,
                   "Type an address like example.com, https://site.org/page "
                   "or host:port.")
+    pres = portal.detect(ctx)
+    if pres.state == "portal":
+        ctx.state["abort"] = True
+        return _r(cid, title, Status.FAIL,
+                  "This network requires signing in on a login page first — "
+                  "until then no site opens, so this one can't be judged.",
+                  portal.login_hint(pres), pres.raw,
+                  login_url=pres.login_url)
     lines, ok = [], 0
     for ip, name in net.INTERNET_ANCHORS[:2]:
         rtt, why = net.tcp_connect(ip, 443, timeout=3.0)
@@ -133,6 +142,16 @@ def check_baseline(ctx: Ctx) -> CheckResult:
     lines.append("DNS example.com — " + ("OK" if not err else err))
     ctx.state["internet_ok"] = ok > 0
     ctx.state["dns_ok"] = not err
+    vpn = net.vpn_uplink(ctx)
+    ctx.state["vpn"] = vpn.name if vpn is not None else ""
+    if ok == 0 and vpn is not None:
+        ctx.state["abort"] = True
+        return _r(cid, title, Status.FAIL,
+                  f"The VPN ({vpn.name}) is on but passes no traffic, so no "
+                  "site can open.",
+                  "Turn the VPN off and check again; then connect it to "
+                  "another server. See the “No connection” tab.",
+                  "\n".join(lines))
     if ok == 0:
         return _r(cid, title, Status.FAIL,
                   "The internet does not work at all on this computer, so "
@@ -304,6 +323,14 @@ def check_tcp(ctx: Ctx) -> CheckResult:
                   "There is no route to this server's address.",
                   "If only IPv6 addresses exist and your network has no "
                   "IPv6, the site can't be reached from here.", raw)
+    vpn = ctx.state.get("vpn")
+    if vpn:
+        return _r(cid, title, Status.FAIL,
+                  f"Connections to port {t.port} time out through the VPN "
+                  f"({vpn}).",
+                  "The VPN server may not reach this site, or the site "
+                  "blocks VPN addresses. Try with the VPN off, or another "
+                  "VPN server/country.", raw)
     return _r(cid, title, Status.FAIL,
               f"Connections to port {t.port} time out — packets are "
               "dropped on the way.",
@@ -337,10 +364,20 @@ def check_tls(ctx: Ctx) -> CheckResult:
     except ssl.SSLCertVerificationError as exc:
         msg = exc.verify_message or str(exc)
         low = msg.lower()
+        cinfo = clock.measure(ctx)
+        if cinfo.wrong:
+            ctx.state["tls_error"] = msg
+            return _r(cid, title, Status.FAIL,
+                      f"Certificate rejected ({msg}) because the system clock "
+                      f"is {clock.fmt_skew(cinfo.skew_s)}.",
+                      clock.fix_steps(cinfo),
+                      raw + "\n" + str(exc) + "\n\n" + cinfo.raw,
+                      clock_skew_s=cinfo.skew_s)
         if "expired" in low or "not yet valid" in low:
-            fix = ("If other HTTPS sites work, the site's certificate has "
-                   "expired (owner's problem). If many sites show this, "
-                   "fix your system clock: `sudo timedatectl set-ntp true`.")
+            fix = ("Your clock is correct" if cinfo.skew_s is not None
+                   else "Your clock could not be verified") + (
+                  ", so the site's own certificate has expired — the "
+                  "owner must renew it. Nothing to fix on your side.")
         elif "self-signed" in low or "unable to get local issuer" in low:
             fix = ("Something between you and the site replaces "
                    "certificates — antivirus, corporate proxy or a block "
@@ -442,6 +479,7 @@ def check_http(ctx: Ctx) -> CheckResult:
     raw = "\n".join(hops) + (f"\nServer: {server}" if server else "")
     m = {"http_code": code, "ttfb_ms": ms}
     if code is None:
+        ctx.state["http_error"] = err
         return _r(cid, title, Status.FAIL,
                   f"No HTTP answer ({err}).",
                   "The server accepted the connection but did not answer "
@@ -457,6 +495,14 @@ def check_http(ctx: Ctx) -> CheckResult:
                      else ""),
                   "The server itself is slow — not your connection."
                   if slow else "", raw, **m)
+    vpn = ctx.state.get("vpn")
+    if vpn and code in (401, 403, 429, 451):
+        return _r(cid, title, Status.WARN if code != 451 else Status.FAIL,
+                  f"The site refuses access (HTTP {code}{srv}) while you are "
+                  f"on the VPN ({vpn}).",
+                  "Many sites block VPN addresses or serve only certain "
+                  "countries. Turn the VPN off or switch to a server in "
+                  "your current country and try again.", raw, **m)
     if code in (401, 403):
         cf = "cloudflare" in server.lower()
         return _r(cid, title, Status.WARN,
@@ -484,6 +530,26 @@ def check_http(ctx: Ctx) -> CheckResult:
                   "HTTP 404 — the server works but this page does not "
                   "exist.", "Check the link / path.", raw, **m)
     return _r(cid, title, Status.WARN, f"HTTP {code}{srv}.", raw=raw, **m)
+
+
+def check_mtu(ctx: Ctx) -> CheckResult:
+    """Only when the server accepts the connection but the secure handshake
+    or the page then stalls — the classic sign of a packet-size problem."""
+    cid, title = "res.mtu", "Packet size limit (MTU)"
+    tls_err = (ctx.state.get("tls_error") or "").lower()
+    http_err = ctx.state.get("http_error", "")
+    stalled = ctx.state.get("tcp_ok") and (
+        any(k in tls_err for k in ("timed out", "timeout", "reset", "eof"))
+        or "timeout" in http_err.lower())
+    if not stalled:
+        return _r(cid, title, Status.SKIP,
+                  "Not needed — no stalled connection.")
+    from nwsolver.diag.speed import mtu_result
+    ip = next((a for a in ctx.state["tcp_ok"] if ":" not in a), "1.1.1.1")
+    r = mtu_result(ctx, cid, title, ip)
+    if r.status is Status.SKIP and ip != "1.1.1.1":
+        r = mtu_result(ctx, cid, title, "1.1.1.1")
+    return r
 
 
 def check_trace(ctx: Ctx) -> CheckResult:
@@ -548,6 +614,7 @@ def make_checks(ctx: Ctx | None = None) -> list[Check]:
         Check("res.tcp", "Connection to the server", check_tcp),
         Check("res.tls", "Secure connection (TLS)", check_tls),
         Check("res.http", "Server response (HTTP)", check_http),
+        Check("res.mtu", "Packet size limit (MTU)", check_mtu),
         Check("res.trace", "Where the route stops", check_trace),
     ]
 
@@ -558,6 +625,28 @@ _CHAIN = [("res.baseline", "Internet"), ("res.hosts", "Hosts"),
 
 
 def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
+    from nwsolver.diag.verdict import (chain_confidence, chain_verdict,
+                                       collect_notes)
+    v = _analyze(results, ctx)
+    steps, broken, degraded = chain_verdict(results, _CHAIN)
+    cause = broken or (degraded if v.state == "warn" else None)
+    v.confidence = ("insufficient" if v.state == "unknown" else
+                    chain_confidence(steps, cause, {"res.tcp"}
+                                     if cause is not None and "time out"
+                                     in (cause.check.summary if cause.check
+                                         else "") else set()))
+    v.notes = collect_notes(results)
+    mtu = next((r for r in results if r.check_id == "res.mtu"
+                and r.status is Status.WARN), None)
+    if mtu is not None and v.state == "fail":
+        v.detail += " " + mtu.summary
+        if mtu.suggestion:
+            v.actions.insert(0, mtu.suggestion)
+        v.confidence = "likely"
+    return v
+
+
+def _analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
     from nwsolver.diag.verdict import chain_verdict
     by_id = {r.check_id: r for r in results}
     steps, broken, degraded = chain_verdict(results, _CHAIN)
@@ -592,6 +681,11 @@ def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
             detail += " " + trace.summary
             if trace.suggestion:
                 actions.append(trace.suggestion)
+        login = c.metrics.get("login_url")
+        if login:
+            return Verdict("fail", "Sign in to the network first.", detail,
+                           actions, steps, c.check_id,
+                           ("Open login page", login))
         return Verdict("fail", f"{name}: {where}", detail, actions, steps,
                        c.check_id)
     if degraded is not None and degraded.check is not None:

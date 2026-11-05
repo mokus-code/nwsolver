@@ -7,8 +7,9 @@ size or the theme re-styles every widget at once.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import (QColor, QDesktopServices, QGuiApplication, QIcon,
+                           QPainter, QPixmap)
 from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel, QLayout,
                                QMenu, QPlainTextEdit, QPushButton,
                                QSizePolicy, QToolButton, QVBoxLayout, QWidget)
@@ -30,8 +31,25 @@ _STATE_FOR_STATUS = {Status.PASS: "ok", Status.WARN: "warn",
                      Status.SKIP: "skip"}
 
 
+def _muted_color() -> str:
+    """Secondary-text colour readable on light *and* dark themes: 60 % of
+    the way from the window background to the normal text colour
+    (palette(mid) almost disappears on dark themes)."""
+    app = QGuiApplication.instance()
+    if app is None:
+        return "#80868b"
+    pal = app.palette()
+    fg = pal.color(pal.ColorRole.WindowText)
+    bg = pal.color(pal.ColorRole.Window)
+    mix = [round(b + (f - b) * 0.62) for f, b in
+           ((fg.red(), bg.red()), (fg.green(), bg.green()),
+            (fg.blue(), bg.blue()))]
+    return "#{:02x}{:02x}{:02x}".format(*mix)
+
+
 def app_stylesheet() -> str:
     p = fonts.px
+    muted = _muted_color()
     return f"""
 QFrame[role="card"] {{
     border: 1px solid palette(mid); border-radius: 8px;
@@ -55,12 +73,18 @@ QLabel[role="state"][state="ok"]   {{ background: #1e8e3e; }}
 QLabel[role="state"][state="warn"] {{ background: #d99a06; }}
 QLabel[role="state"][state="fail"] {{ background: #d93025; }}
 QLabel[role="state"][state="busy"] {{ background: #1a73e8; }}
+QLabel[role="badge"] {{
+    border: 1px solid palette(mid); border-radius: 6px; padding: 1px 7px;
+    font-size: {p(11)}px; font-weight: 600;
+}}
+QLabel[role="badge"][state="confirmed"]    {{ border-color: #d93025; }}
+QLabel[role="badge"][state="likely"]       {{ border-color: #d99a06; }}
 QLabel[role="headline"] {{ font-size: {p(19)}px; font-weight: 700; }}
 QLabel[role="section"]  {{ font-size: {p(14)}px; font-weight: 700; }}
 QLabel[role="title"]    {{ font-weight: 700; }}
-QLabel[role="muted"]    {{ color: palette(mid); font-size: {p(11)}px; }}
+QLabel[role="muted"]    {{ color: {muted}; font-size: {p(11)}px; }}
 QLabel[role="fix"]      {{ font-style: italic; }}
-QLabel[role="tile-caption"] {{ color: palette(mid); font-size: {p(11)}px; }}
+QLabel[role="tile-caption"] {{ color: {muted}; font-size: {p(11)}px; }}
 QLabel[role="tile-value"]   {{ font-size: {p(18)}px; font-weight: 700; }}
 QLabel[role="pill"] {{
     color: white; border-radius: 9px; padding: 2px 9px;
@@ -241,6 +265,14 @@ class VerdictBanner(QFrame):
         self.state_label.setSizePolicy(QSizePolicy.Policy.Fixed,
                                        QSizePolicy.Policy.Fixed)
         self.headline = WrapLabel(idle_text, "headline")
+        self.changes = WrapLabel("", "muted")
+        self.changes.hide()
+        self.conf_label = QLabel("")
+        set_role(self.conf_label, "badge")
+        self.conf_label.hide()
+        self.notes = WrapLabel("")
+        self.notes.setTextFormat(Qt.TextFormat.RichText)
+        self.notes.hide()
         self.detail = WrapLabel("")
         self.actions = WrapLabel("")
         self.actions.setTextFormat(Qt.TextFormat.RichText)
@@ -258,8 +290,20 @@ class VerdictBanner(QFrame):
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(8)
         lay.addLayout(top)
+        lay.addWidget(self.conf_label, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(self.changes)
         lay.addWidget(self.detail)
         lay.addWidget(self.actions)
+        self.link_btn = QPushButton()
+        set_role(self.link_btn, "primary")
+        self.link_btn.clicked.connect(self._open_link)
+        self.link_btn.hide()
+        self._link_url = ""
+        link_row = QHBoxLayout()
+        link_row.addWidget(self.link_btn)
+        link_row.addStretch(1)
+        lay.addLayout(link_row)
+        lay.addWidget(self.notes)
         lay.addWidget(self.pills_box)
 
     def set_busy(self, text: str):
@@ -267,6 +311,18 @@ class VerdictBanner(QFrame):
         self.headline.setText(text)
         self.detail.hide()
         self.actions.hide()
+        self.link_btn.hide()
+        self.conf_label.hide()
+        self.notes.hide()
+        self.changes.hide()
+
+    def set_changes(self, text: str):
+        self.changes.setText(text)
+        self.changes.setVisible(bool(text))
+
+    def _open_link(self):
+        if self._link_url:
+            QDesktopServices.openUrl(QUrl(self._link_url))
 
     def set_progress_steps(self, steps):
         """Show the chain pills while running (all grey)."""
@@ -301,6 +357,32 @@ class VerdictBanner(QFrame):
             pill.setToolTip(step.check.summary if step.check else "")
             self.pills.addWidget(pill)
         self.pills_box.setVisible(bool(verdict.steps))
+        from nwsolver.diag.verdict import CONFIDENCE_LABELS
+        conf = getattr(verdict, "confidence", "")
+        if conf and verdict.state != "ok" or conf == "insufficient":
+            self.conf_label.setText(CONFIDENCE_LABELS.get(conf, conf))
+            set_state(self.conf_label, conf)
+            self.conf_label.setToolTip({
+                "confirmed": "The fault was measured directly.",
+                "likely": "The most probable explanation of what was "
+                          "measured; other causes are possible.",
+                "insufficient": "Too few checks could run to be sure.",
+            }.get(conf, ""))
+            self.conf_label.show()
+        else:
+            self.conf_label.hide()
+        notes = [n for n in getattr(verdict, "notes", []) if n]
+        if notes:
+            items = "".join(f"<li>{_md_code(n)}</li>" for n in notes)
+            self.notes.setText(f"<b>Also noted:</b><ul style='margin:0 0 0 "
+                               f"-20px'>{items}</ul>")
+        self.notes.setVisible(bool(notes))
+        link = getattr(verdict, "link", None)
+        self._link_url = link[1] if link and link[1] else ""
+        if self._link_url:
+            self.link_btn.setText(link[0])
+            self.link_btn.setToolTip(self._link_url)
+        self.link_btn.setVisible(bool(self._link_url))
 
     def _set_state(self, state: str):
         set_state(self, state if state in ("ok", "warn", "fail") else

@@ -7,11 +7,10 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 
-from PySide6.QtCore import QSettings, QThread
+from PySide6.QtCore import QByteArray, QSettings, QThread, QTimer
 from PySide6.QtGui import QAction, QFont, QGuiApplication, QKeySequence
-from PySide6.QtWidgets import (QApplication, QFileDialog, QLabel, QMainWindow,
+from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow,
                                QMessageBox, QProgressBar, QTabWidget,
                                QToolBar)
 
@@ -19,7 +18,8 @@ from nwsolver.ai.assistant import build_prompt
 from nwsolver.ai.client import AIClient
 from nwsolver.engine.checks import CheckResult, Ctx
 from nwsolver.engine.collector import collect_env
-from nwsolver.engine.report import build_report
+from nwsolver.engine import history
+from nwsolver.engine.context import changes_text
 from nwsolver.ui import fonts
 from nwsolver.ui.ai_dialog import AiResultDialog
 from nwsolver.ui.ai_worker import AiWorker
@@ -78,10 +78,17 @@ class MainWindow(QMainWindow):
             "fix recommendations")
         self.copy_action.triggered.connect(self.copy_for_ai)
 
-        self.report_action = QAction("Save for AI…", self)
+        self.report_action = QAction("Export…", self)
         self.report_action.setShortcut(QKeySequence("Ctrl+E"))
-        self.report_action.setToolTip("Save the same text as a Markdown file")
+        self.report_action.setToolTip(
+            "Preview and export as AI prompt, Markdown report or JSON — "
+            "with options to hide IP/MAC addresses and names")
         self.report_action.triggered.connect(self.export_report)
+
+        self.history_action = QAction("History", self)
+        self.history_action.setShortcut(QKeySequence("Ctrl+H"))
+        self.history_action.setToolTip("Earlier checks and what changed")
+        self.history_action.triggered.connect(self.show_history)
 
         self.ai_action = QAction("Ask AI", self)
         self.ai_action.setShortcut(QKeySequence("Ctrl+Shift+A"))
@@ -119,6 +126,7 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.copy_action)
         file_menu.addAction(self.report_action)
+        file_menu.addAction(self.history_action)
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
         view_menu = self.menuBar().addMenu("&View")
@@ -138,6 +146,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         toolbar.addAction(self.copy_action)
         toolbar.addAction(self.report_action)
+        toolbar.addAction(self.history_action)
         toolbar.addAction(self.ai_action)
         toolbar.addAction(self.root_action)
 
@@ -157,13 +166,61 @@ class MainWindow(QMainWindow):
             pt = int(str(saved))
         except ValueError:
             pt = self._default_pt
-        self.apply_font_pt(pt)
-        self._fit_to_screen()
+        self.apply_font_pt(pt, save=False)
+        self._restore_window()
+        # Save size/position shortly after the user stops moving/resizing,
+        # so it survives even if the app is killed rather than closed.
+        self._geo_timer = QTimer(self)
+        self._geo_timer.setSingleShot(True)
+        self._geo_timer.setInterval(800)
+        self._geo_timer.timeout.connect(self._save_window)
         self._refresh_actions()
 
         self._run_suite(self.conn_page.suite, {})
 
     # -- geometry ------------------------------------------------------------
+
+    def _restore_window(self):
+        """Reopen with the saved size and position; fall back to a size
+        derived from the screen if nothing was saved or it is off-screen."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            self.setMinimumSize(min(420, avail.width()),
+                                min(420, avail.height()))
+        geo = self.settings.value("window/geometry")
+        if isinstance(geo, QByteArray) and not geo.isEmpty() and \
+                self.restoreGeometry(geo):
+            frame = self.frameGeometry()
+            if any(sc.availableGeometry().intersects(frame)
+                   for sc in QGuiApplication.screens()):
+                return
+        self._fit_to_screen()
+
+    def _save_window(self):
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self._sync_settings()
+
+    def _sync_settings(self):
+        self.settings.sync()
+        if self.settings.status() != QSettings.Status.NoError and \
+                not getattr(self, "_settings_warned", False):
+            self._settings_warned = True
+            path = self.settings.fileName()
+            self.statusBar().showMessage(
+                f"Settings can't be saved: {path} is not writable (was the "
+                "app run as root?). Fix: sudo chown -R $USER "
+                "~/.config/nwsolver", 15000)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, "_geo_timer"):
+            self._geo_timer.start()
+
+    def moveEvent(self, event):  # noqa: N802
+        super().moveEvent(event)
+        if hasattr(self, "_geo_timer"):
+            self._geo_timer.start()
 
     def _fit_to_screen(self):
         """Open at a comfortable size that always fits the current screen."""
@@ -224,6 +281,11 @@ class MainWindow(QMainWindow):
         page = self._page_running
         if page is not None:
             page.finished(run)
+            saved = history.save(run)
+            if saved is not None:
+                prev = history.previous(saved)
+                if prev is not None:
+                    page.banner.set_changes(changes_text(prev, saved))
         v = run["verdict"]
         self.status_label.setText(f"{v.headline}  ({run['elapsed']:.0f} s)")
 
@@ -243,6 +305,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def closeEvent(self, event):  # noqa: N802
+        self._save_window()
         if self._thread is not None and self._worker is not None:
             self._worker.cancel()
             self._thread.quit()
@@ -330,7 +393,7 @@ class MainWindow(QMainWindow):
 
     # -- font size -------------------------------------------------------------
 
-    def apply_font_pt(self, pt: int):
+    def apply_font_pt(self, pt: int, save: bool = True):
         pt = max(8, min(24, int(pt)))
         fonts.set_font_pt(pt)
         app = QApplication.instance()
@@ -339,38 +402,36 @@ class MainWindow(QMainWindow):
             font.setPointSize(pt)
             app.setFont(font)
             app.setStyleSheet(app_stylesheet())
-        self.settings.setValue("font_pt", pt)
+        if save:
+            self.settings.setValue("font_pt", pt)
+            self._sync_settings()
 
     # -- export & elevation ----------------------------------------------------
 
     def copy_for_ai(self):
+        """Quick copy: AI prompt with the default privacy masks."""
         runs = self._runs()
         if not runs:
             return
-        QGuiApplication.clipboard().setText(build_report(self.env, runs))
+        from nwsolver.engine.context import MaskOptions
+        from nwsolver.ui.export_dialog import render
+        QGuiApplication.clipboard().setText(
+            render("ai", self.env, runs, MaskOptions(), True))
         self.statusBar().showMessage(
-            "Copied — paste it into an AI chat (Ctrl+V) to get "
-            "recommendations", 8000)
+            "Copied (public IP, MAC and names hidden) — paste it into an AI "
+            "chat with Ctrl+V. Use Export… to preview or change what is "
+            "hidden.", 9000)
 
     def export_report(self):
         runs = self._runs()
         if not runs:
             return
-        default = os.path.join(
-            os.path.expanduser("~"),
-            f"nwsolver-ai-context-{datetime.now():%Y%m%d-%H%M%S}.md")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save for AI", default, "Markdown (*.md);;All files (*)")
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(build_report(self.env, runs))
-        except OSError as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
-            return
-        self.statusBar().showMessage(
-            f"Saved to {path} — attach or paste it into an AI chat", 8000)
+        from nwsolver.ui.export_dialog import ExportDialog
+        ExportDialog(self.env, runs, self.settings, self).exec()
+
+    def show_history(self):
+        from nwsolver.ui.history_dialog import HistoryDialog
+        HistoryDialog(self).exec()
 
     def relaunch_as_root(self):
         """Restart via pkexec, passing the X display explicitly (pkexec

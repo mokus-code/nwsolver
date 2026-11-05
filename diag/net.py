@@ -750,3 +750,294 @@ def fmt_mbps(mbps: float | None) -> str:
     if mbps is None:
         return "—"
     return f"{mbps:.0f} Mbit/s" if mbps >= 10 else f"{mbps:.1f} Mbit/s"
+
+
+# --------------------------------------------------------------------------
+# VPN
+# --------------------------------------------------------------------------
+
+def vpn_uplink(ctx: Ctx) -> Iface | None:
+    """The VPN interface internet traffic goes through, or None."""
+    itf = find_iface(ctx, uplink(ctx).dev)
+    return itf if itf is not None and itf.kind == "vpn" else None
+
+
+def physical_gateway(ctx: Ctx) -> tuple[str | None, str | None]:
+    """(device, gateway) of the real network under a VPN.
+
+    VPN clients (wg-quick, OpenVPN redirect-gateway, NetworkManager) keep
+    the original default route in the main table, so it is read from there.
+    """
+    cached = ctx.state.get("_phys_gw")
+    if cached is not None:
+        return cached
+    out: tuple[str | None, str | None] = (None, None)
+    res = ctx.run(["ip", "-j", "route", "show", "default"])
+    try:
+        routes = json.loads(res.stdout or "[]") if res.ok else []
+    except ValueError:
+        routes = []
+    for r in sorted(routes, key=lambda r: r.get("metric", 0)):
+        cand = find_iface(ctx, r.get("dev"))
+        if cand is not None and cand.physical:
+            out = (cand.name, r.get("gateway"))
+            break
+    if out == (None, None) and res.command_not_found:
+        dev, gw = _proc_default_route(ctx)
+        cand = find_iface(ctx, dev)
+        if cand is not None and cand.physical:
+            out = (dev, gw)
+    ctx.state["_phys_gw"] = out
+    return out
+
+
+def local_gateway(ctx: Ctx) -> str | None:
+    """The router on the local network (under a VPN: the real one)."""
+    if vpn_uplink(ctx) is not None:
+        return physical_gateway(ctx)[1]
+    return uplink(ctx).gateway
+
+
+# --------------------------------------------------------------------------
+# Wi-Fi details: BSSID, channel, width, security (nmcli + iw, no root)
+# --------------------------------------------------------------------------
+
+def _nmcli_split(line: str) -> list[str]:
+    """Split one `nmcli -t` line, honouring escaped colons."""
+    return [p.replace("\x00", ":") for p in
+            line.replace("\\:", "\x00").split(":")]
+
+
+def wifi_details(ctx: Ctx, iface: str) -> dict:
+    """Facts about the access point in use. Keys may be None."""
+    cached = ctx.state.setdefault("_wifi_details", {}).get(iface)
+    if cached is not None:
+        return cached
+    d: dict = {"ssid": None, "bssid": None, "channel": None, "freq": None,
+               "width": None, "security": None, "signal_pct": None,
+               "raw": ""}
+    if ctx.which("nmcli"):
+        res = ctx.run(["nmcli", "-t", "-f",
+                       "IN-USE,SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY",
+                       "device", "wifi", "list", "ifname", iface,
+                       "--rescan", "no"], timeout=8.0)
+        d["raw"] = "$ nmcli device wifi list\n" + res.text
+        for line in res.text.splitlines():
+            p = _nmcli_split(line)
+            if len(p) >= 7 and p[0] == "*":
+                d["ssid"], d["bssid"] = p[1] or None, p[2] or None
+                try:
+                    d["channel"] = int(p[3])
+                except ValueError:
+                    pass
+                m = re.search(r"(\d+)", p[4])
+                d["freq"] = int(m.group(1)) if m else None
+                try:
+                    d["signal_pct"] = int(p[5])
+                except ValueError:
+                    pass
+                sec = p[6].strip()
+                d["security"] = "open" if sec in ("", "--") else sec
+                break
+    if ctx.which("iw"):
+        res = ctx.run(["iw", "dev", iface, "info"], timeout=4.0)
+        m = re.search(r"width:\s*(\d+)\s*MHz", res.text)
+        if m:
+            d["width"] = int(m.group(1))
+        m = re.search(r"channel\s+(\d+)", res.text)
+        if m and d["channel"] is None:
+            d["channel"] = int(m.group(1))
+        d["raw"] += "\n$ iw dev info\n" + res.text
+    ctx.state["_wifi_details"][iface] = d
+    return d
+
+
+def wifi_is_open(details: dict) -> bool:
+    return details.get("security") == "open"
+
+
+# --------------------------------------------------------------------------
+# Phone hotspot / USB tethering
+# --------------------------------------------------------------------------
+
+_TETHER_DRIVERS = {"rndis_host": "USB tethering", "cdc_ether": "USB tethering",
+                   "cdc_ncm": "USB tethering", "ipheth": "iPhone USB tethering"}
+_HOTSPOT_SSID = re.compile(
+    r"iphone|android|galaxy|redmi|xiaomi|pixel|huawei|honor|oneplus|"
+    r"oppo|vivo|realme|nokia|motorola|moto |poco", re.I)
+_HOTSPOT_GW = {"172.20.10.1": "iPhone hotspot", "192.168.43.1":
+               "Android hotspot"}
+
+
+def hotspot_info(ctx: Ctx) -> str:
+    """'' or a label such as 'iPhone hotspot' / 'USB tethering'."""
+    cached = ctx.state.get("_hotspot")
+    if cached is not None:
+        return cached
+    label = ""
+    itf = physical_uplink(ctx)
+    gw = local_gateway(ctx) or ""
+    if itf is not None:
+        label = _TETHER_DRIVERS.get(itf.driver, "")
+        if not label and itf.kind == "wifi":
+            ssid = wifi_link(ctx, itf.name).get("ssid") or ""
+            if _HOTSPOT_SSID.search(ssid):
+                label = ("iPhone hotspot" if "iphone" in ssid.lower()
+                         else "Phone hotspot")
+        if not label and gw in _HOTSPOT_GW:
+            label = _HOTSPOT_GW[gw]
+        if not label and ctx.which("nmcli"):
+            res = ctx.run(["nmcli", "-g", "GENERAL.METERED", "device", "show",
+                           itf.name], timeout=4.0)
+            # NetworkManager marks Android hotspots as metered (guessed).
+            if res.text.strip().lower().startswith("yes (guessed)"):
+                label = "Phone hotspot"
+    ctx.state["_hotspot"] = label
+    return label
+
+
+def hotspot_tips(label: str, problem: str) -> str:
+    """Extra advice when the connection is a phone hotspot."""
+    if not label:
+        return ""
+    if problem == "slow":
+        return (f"You are connected through a phone ({label}): the speed "
+                "is the phone's mobile "
+                "signal. Put the phone near a window, check it shows "
+                "4G/5G, turn off its Low Data / Battery Saver mode, and "
+                "check the data plan is not throttled.")
+    return (f"You are connected through a phone ({label}), so the "
+            "internet comes from its mobile data: check that mobile data "
+            "is on and has credit, enable Data Roaming if you are abroad, "
+            "keep the "
+            "hotspot screen open on iPhone, and turn the hotspot off and "
+            "on. Some plans block tethering.")
+
+
+# --------------------------------------------------------------------------
+# MAC address policy (portals remember devices by MAC)
+# --------------------------------------------------------------------------
+
+def mac_policy(ctx: Ctx, iface: str) -> tuple[str, str]:
+    """(connection name, cloned-mac setting) for the active Wi-Fi."""
+    nm = nm_state(ctx)
+    conn = (nm.get("devices", {}).get(iface) or {}).get("connection", "")
+    if not conn or not ctx.which("nmcli"):
+        return conn, ""
+    res = ctx.run(["nmcli", "-g", "802-11-wireless.cloned-mac-address",
+                   "connection", "show", conn], timeout=4.0)
+    return conn, res.text.strip().lower()
+
+
+# --------------------------------------------------------------------------
+# Path MTU (ping -M do, binary search) — no root needed
+# --------------------------------------------------------------------------
+
+def path_mtu(ctx: Ctx, host: str) -> tuple[int | None, str]:
+    """Largest packet (bytes, incl. 28-byte IP/ICMP header) that reaches
+    ``host`` without fragmentation, or (None, reason)."""
+    if not ctx.which("ping"):
+        return None, "ping not installed"
+
+    def fits(payload: int) -> bool | None:
+        res = ctx.run(["ping", "-n", "-c", "1", "-W", "1", "-M", "do",
+                       "-s", str(payload), host], timeout=4.0)
+        if res.permission_denied:
+            return None
+        return res.ok and " 0% packet loss" in res.stdout
+
+    small = fits(500)
+    if small is None:
+        return None, "ping not permitted"
+    if not small:
+        return None, f"{host} does not answer ping"
+    if fits(1472):
+        return 1500, ""
+    lo, hi = 500, 1472
+    steps = 0
+    while hi - lo > 1 and steps < 10:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid
+        steps += 1
+    return lo + 28, ""
+
+
+# --------------------------------------------------------------------------
+# UDP reachability via STUN (what video calls and WireGuard need)
+# --------------------------------------------------------------------------
+
+STUN_SERVERS = (("stun.l.google.com", 19302), ("stun.cloudflare.com", 3478),
+                ("global.stun.twilio.com", 3478))
+
+
+@dataclass
+class StunResult:
+    ok: bool = False
+    server: str = ""
+    rtt_ms: float | None = None
+    mapped: str = ""          # public address:port as seen by the server
+    error: str = ""
+    raw: str = ""
+
+
+def stun_probe(timeout: float = 2.0) -> StunResult:
+    """Send a STUN Binding Request (RFC 5389) to public servers over UDP."""
+    res = StunResult()
+    lines = []
+    for host, port in STUN_SERVERS:
+        try:
+            addr = socket.getaddrinfo(host, port, socket.AF_INET,
+                                      socket.SOCK_DGRAM)[0][4]
+        except socket.gaierror as exc:
+            lines.append(f"{host}:{port} — DNS: {exc.strerror or exc}")
+            res.error = "DNS failed"
+            continue
+        tid = os.urandom(12)
+        packet = struct.pack(">HHI", 0x0001, 0, 0x2112A442) + tid
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        start = time.monotonic()
+        try:
+            sock.sendto(packet, addr)
+            data, _ = sock.recvfrom(2048)
+        except (socket.timeout, TimeoutError):
+            lines.append(f"{host}:{port} ({addr[0]}) — no UDP reply")
+            res.error = "no UDP reply"
+            continue
+        except OSError as exc:
+            lines.append(f"{host}:{port} — {os_reason(exc)}")
+            res.error = os_reason(exc)
+            continue
+        finally:
+            sock.close()
+        rtt = (time.monotonic() - start) * 1000.0
+        if len(data) < 20 or data[8:20] != tid:
+            lines.append(f"{host}:{port} — unexpected reply")
+            continue
+        res.ok, res.server, res.rtt_ms = True, f"{host}:{port}", rtt
+        res.mapped = _stun_mapped(data)
+        lines.append(f"{host}:{port} — reply in {fmt_ms(rtt)}"
+                     + (f", public address {res.mapped}" if res.mapped
+                        else ""))
+        break
+    res.raw = "UDP STUN Binding Request:\n" + "\n".join(lines)
+    return res
+
+
+def _stun_mapped(data: bytes) -> str:
+    off = 20
+    while off + 4 <= len(data):
+        atype, alen = struct.unpack(">HH", data[off:off + 4])
+        val = data[off + 4:off + 4 + alen]
+        if atype in (0x0020, 0x0001) and len(val) >= 8 and val[1] == 1:
+            port = struct.unpack(">H", val[2:4])[0]
+            ip = bytes(val[4:8])
+            if atype == 0x0020:
+                port ^= 0x2112
+                ip = bytes(b ^ m for b, m in zip(ip, b"\x21\x12\xa4\x42"))
+            return f"{socket.inet_ntoa(ip)}:{port}"
+        off += 4 + alen + ((4 - alen % 4) % 4)
+    return ""

@@ -9,7 +9,6 @@ left out on purpose.
 from __future__ import annotations
 
 import datetime
-import re
 from typing import Any
 
 from nwsolver.engine.checks import CheckResult, Status
@@ -42,18 +41,13 @@ def answer_language(env: dict[str, Any]) -> str:
 
 def _short(text: str, limit: int = 160) -> str:
     text = " ".join((text or "").split())
-    text = re.sub(r"\s*Public IP \S+(?: \([^)]*\))?\.?", "", text)
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-_MAC = re.compile(r"\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b", re.I)
-_PUBLIC_IP = re.compile(r"\bip=\S+")
 
 
 def _evidence(raw: str) -> str:
     raw = (raw or "").strip()
-    raw = _MAC.sub("xx:xx:xx:xx:xx:xx", raw)
-    raw = _PUBLIC_IP.sub("ip=<hidden>", raw)
     if len(raw) > _EVIDENCE_MAX:
         raw = raw[:_EVIDENCE_MAX].rstrip() + "\n… (shortened)"
     return raw
@@ -156,8 +150,13 @@ def _section(suite_id: str, run: dict) -> list[str]:
     target = (run.get("options") or {}).get("target") or ""
     when = datetime.datetime.fromtimestamp(run.get("when", 0))
     out = [f"## {_SECTION[suite_id].format(target=target)}", ""]
+    from nwsolver.diag.verdict import CONFIDENCE_LABELS
+    conf = getattr(v, "confidence", "")
     out.append(f"Automatic verdict ({when:%H:%M}): **{_STATE.get(v.state, v.state)}** "
-               f"— {v.headline}" + (f" {v.detail}" if v.detail else ""))
+               + (f"({CONFIDENCE_LABELS.get(conf, conf)}) " if conf else "")
+               + f"— {v.headline}" + (f" {v.detail}" if v.detail else ""))
+    for note in getattr(v, "notes", []):
+        out.append(f"- Also noted: {note}")
     if v.steps:
         out.append("")
         out.append("Chain: " + " → ".join(
@@ -195,7 +194,9 @@ def _section(suite_id: str, run: dict) -> list[str]:
     return out
 
 
-def build_ai_context(env: dict[str, Any], runs: dict[str, dict]) -> str:
+def build_ai_context(env: dict[str, Any], runs: dict[str, dict],
+                     history: list[dict] | None = None,
+                     masker=None) -> str:
     """Markdown text to paste into an AI chat (also used for the built-in
     assistant)."""
     order = [s for s in ("connection", "speed", "resource") if runs.get(s)]
@@ -240,7 +241,43 @@ def build_ai_context(env: dict[str, Any], runs: dict[str, dict]) -> str:
     out.append("")
     for s in order:
         out.extend(_section(s, runs[s]))
-    return "\n".join(out).rstrip() + "\n"
+    if history:
+        from nwsolver.engine.context import SUITE_TITLES, build_context
+        ctx = build_context(env, runs, history)
+        if ctx["repeated_checks"]:
+            out += ["## Re-check results (compared with the previous run)",
+                    ""]
+            for c in ctx["repeated_checks"]:
+                out.append(f"- {SUITE_TITLES.get(c['suite'], c['suite'])} "
+                           f"vs {c['previous_check']}: "
+                           + ("; ".join(c["changes"]) or "no change"))
+            out.append("")
+        if ctx["timeline"]:
+            out += ["## Earlier checks (newest first)", ""]
+            for t in ctx["timeline"][:8]:
+                rec = t["recommendations"][0] if t["recommendations"] else ""
+                out.append(f"- {t['time']} · "
+                           f"{SUITE_TITLES.get(t['suite'], t['suite'])}"
+                           + (f" ({t['target']})" if t.get("target") else "")
+                           + f": {t['state'].upper()} — {t['headline']}"
+                           + (f" Advice given: {_short(rec, 140)}" if rec
+                              else ""))
+            out.append("")
+    text = "\n".join(out).rstrip() + "\n"
+    if masker is None:
+        from nwsolver.engine.context import MaskOptions, Masker
+        masker = Masker(MaskOptions(), _ssids(runs), env.get("hostname", ""),
+                        env.get("user", ""))
+    return masker.text(text)
+
+
+def _ssids(runs: dict[str, dict]) -> list[str]:
+    out = []
+    for run in runs.values():
+        ov = run.get("overview") or {}
+        if "Wi-Fi" in str(ov.get("type") or "") and ov.get("network"):
+            out.append(str(ov["network"]))
+    return out
 
 
 # Backwards-compatible name used by the UI.

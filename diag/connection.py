@@ -7,15 +7,16 @@ Docker bridges, veths, libvirt/VirtualBox networks etc. are ignored.
 """
 from __future__ import annotations
 
-import datetime
-import email.utils
 import socket
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
 
-from nwsolver.diag import net
-from nwsolver.diag.verdict import Verdict, chain_verdict
+from nwsolver import __version__
+from nwsolver.diag import clock, net, portal
+from nwsolver.diag.verdict import (Verdict, chain_confidence, chain_verdict,
+                                   collect_notes)
 from nwsolver.engine.checks import Check, CheckResult, Ctx, Status
 
 SUITE_ID = "connection"
@@ -29,12 +30,14 @@ CHAIN = [
     ("conn.ip", "IP address"),
     ("conn.route", "Route"),
     ("conn.gateway", "Router"),
+    ("conn.portal", "Login page"),
     ("conn.internet", "Internet"),
     ("conn.dns", "DNS"),
+    ("conn.clock", "Clock"),
     ("conn.web", "Web"),
 ]
 
-_UA = "nwsolver/0.2 (network diagnostics)"
+_UA = f"nwsolver/{__version__} (network diagnostics)"
 
 
 def _r(cid: str, title: str, status: Status, summary: str, fix: str = "",
@@ -153,6 +156,14 @@ def _link_up(ctx: Ctx, i: net.Iface) -> tuple[bool, str]:
             band = net.wifi_band(w["freq"])
             if band:
                 bits.append(band)
+            d = net.wifi_details(ctx, i.name)
+            if d.get("channel"):
+                bits.append(f"channel {d['channel']}"
+                            + (f" ({d['width']} MHz)" if d.get("width")
+                               else ""))
+            if d.get("security"):
+                bits.append("no password (open network)"
+                            if net.wifi_is_open(d) else d["security"])
             return True, f"Wi-Fi {i.name}: " + ", ".join(bits)
         return False, f"Wi-Fi {i.name}: not connected to any network"
     if i.carrier:
@@ -182,6 +193,8 @@ def check_link(ctx: Ctx) -> CheckResult:
     raw = "\n".join(lines) + "\n\n" + nm.get("raw", "")
     for w in ctx.state.get("_wifi", {}).values():
         raw += "\n\n" + w["raw"]
+    for d in ctx.state.get("_wifi_details", {}).values():
+        raw += "\n\n" + d.get("raw", "")
     if not linked:
         has_wifi = any(i.kind == "wifi" for i in phys)
         has_eth = any(i.kind == "ethernet" for i in phys)
@@ -323,17 +336,28 @@ def check_gateway(ctx: Ctx) -> CheckResult:
     if up.dev is None:
         return _r(cid, title, Status.FAIL, "No gateway is configured.",
                   "Fix the route first.")
-    if not up.gateway:
+    vpn = net.vpn_uplink(ctx)
+    gw_ip, gw_dev, note = up.gateway, up.dev, ""
+    if vpn is not None:
+        # Under a VPN check the real (hotel/home) router, not the tunnel.
+        gw_dev, gw_ip = net.physical_gateway(ctx)
+        note = f" (the network under the VPN {vpn.name})"
+        if not gw_ip:
+            return _r(cid, title, Status.PASS,
+                      f"Traffic goes through the VPN {vpn.name}; the router "
+                      "under it could not be identified.")
+    elif not gw_ip:
         return _r(cid, title, Status.PASS,
                   f"{up.dev} is a point-to-point link (no router to check).")
+    up = net.Uplink(dev=gw_dev, gateway=gw_ip)
     st = net.latency(ctx, up.gateway, count=4, tcp_port=80)
     neigh = net.neighbor_state(ctx, up.gateway, up.dev)
     raw = st.raw + f"\n\nARP/neighbour state of {up.gateway}: " + \
         (neigh or "none")
     metrics = {"rtt_ms": st.avg_ms, "loss_pct": st.loss_pct}
     if st.ok:
-        summary = (f"Router {up.gateway} answers: {net.fmt_ms(st.avg_ms)}, "
-                   f"{st.loss_pct:.0f}% loss.")
+        summary = (f"Router {up.gateway}{note} answers: "
+                   f"{net.fmt_ms(st.avg_ms)}, {st.loss_pct:.0f}% loss.")
         if st.loss_pct >= 25:
             return _r(cid, title, Status.WARN, summary,
                       "Packets are lost between you and the router — weak "
@@ -352,6 +376,120 @@ def check_gateway(ctx: Ctx) -> CheckResult:
 
 
 # --------------------------------------------------------------------------
+# 5b. Captive portal (hotel / café / office Wi-Fi login page)
+# --------------------------------------------------------------------------
+
+def _mac_note(ctx: Ctx) -> str:
+    itf = net.physical_uplink(ctx)
+    if itf is None or itf.kind != "wifi":
+        return ""
+    conn, policy = net.mac_policy(ctx, itf.name)
+    if policy == "random":
+        return (f"The Wi-Fi profile “{conn}” uses a new random MAC address "
+                "on every connection, so the hotel will ask you to sign in "
+                "again after each reconnect. To keep the login: `nmcli "
+                f"connection modify \"{conn}\" "
+                "802-11-wireless.cloned-mac-address stable`.")
+    return ""
+
+
+def check_portal(ctx: Ctx) -> CheckResult:
+    cid, title = "conn.portal", "Login page (captive portal)"
+    res = portal.detect(ctx)
+    if res.state == "portal":
+        names = ", ".join(p.name for p in res.intercepted) or \
+            "NetworkManager"
+        note = _mac_note(ctx)
+        return _r(cid, title, Status.FAIL,
+                  "This network requires signing in on a login page "
+                  "(captive portal) before it lets you onto the internet. "
+                  f"Intercepted checks: {names}.",
+                  portal.login_hint(res), res.raw, login_url=res.login_url,
+                  note=note)
+    if res.state == "none":
+        filtered = [p.name for p in res.intercepted]
+        note = (f" (the {filtered[0]} check address is filtered — normal "
+                "with ad/DNS filters)" if filtered else "")
+        return _r(cid, title, Status.PASS,
+                  "No login page — the network lets traffic through."
+                  + note, raw=res.raw)
+    if res.under_vpn:
+        page = (f" The router's page {res.gateway_page} answers — it may "
+                "be the hotel's login page." if res.gateway_page else "")
+        return _r(cid, title, Status.SKIP,
+                  f"Could not check for a login page: the checks went into "
+                  f"the VPN {res.under_vpn} and got no answer." + page,
+                  raw=res.raw, login_url=res.gateway_page)
+    return _r(cid, title, Status.SKIP,
+              "Could not check for a login page: no web check address "
+              "answered.", raw=res.raw)
+
+
+# --------------------------------------------------------------------------
+# 5c. Network security (not part of the chain — shown as a note)
+# --------------------------------------------------------------------------
+
+def check_security(ctx: Ctx) -> CheckResult:
+    cid, title = "conn.security", "Network security"
+    itf = net.physical_uplink(ctx)
+    bits, notes = [], []
+    if itf is not None and itf.kind == "wifi":
+        d = net.wifi_details(ctx, itf.name)
+        if net.wifi_is_open(d):
+            notes.append("This Wi-Fi has no password: people nearby can "
+                         "see unencrypted traffic. Use only https:// sites "
+                         "and, ideally, a VPN.")
+        elif d.get("security"):
+            bits.append(f"Wi-Fi encryption: {d['security']}")
+        if d.get("bssid"):
+            bits.append(f"access point {d['bssid']}")
+    proxy = net.proxy_env()
+    if proxy:
+        notes.append("A proxy is configured, so web traffic passes through "
+                     f"{next(iter(proxy.values()))}. Make sure you set it "
+                     "up yourself.")
+    if not bits and not notes:
+        return _r(cid, title, Status.SKIP,
+                  "Wired connection — nothing to check.")
+    summary = "; ".join(bits) + ("." if bits else "")
+    if notes:
+        return _r(cid, title, Status.WARN, (summary + " " if summary else "")
+                  + " ".join(notes), raw=summary, note=" ".join(notes))
+    return _r(cid, title, Status.PASS, summary)
+
+
+# --------------------------------------------------------------------------
+# 5d. UDP (video calls, WireGuard / OpenVPN-UDP) — a note, not a chain step
+# --------------------------------------------------------------------------
+
+def check_udp(ctx: Ctx) -> CheckResult:
+    cid, title = "conn.udp", "UDP traffic (calls, VPN)"
+    if portal.detect(ctx).state == "portal":
+        return _r(cid, title, Status.SKIP, "Not tested before signing in "
+                  "on the network's login page.")
+    tcp_ok = any(net.tcp_connect(ip, 443, 3.0)[0] is not None
+                 for ip, _n in net.INTERNET_ANCHORS[:2])
+    stun = net.stun_probe()
+    vpn = net.vpn_uplink(ctx)
+    via = f" (tested through the VPN {vpn.name})" if vpn is not None else ""
+    if stun.ok:
+        return _r(cid, title, Status.PASS,
+                  f"UDP works{via}: video calls and UDP-based VPNs can "
+                  "connect.", raw=stun.raw, udp_ok=True)
+    if not tcp_ok:
+        return _r(cid, title, Status.SKIP,
+                  "Not tested — there is no internet connection at all.",
+                  raw=stun.raw)
+    note = ("This network blocks UDP traffic" + via + ": video calls fall "
+            "back to slower relays (more lag), and VPNs using UDP "
+            "(WireGuard, OpenVPN-UDP, most VPN apps by default) won't "
+            "connect. Switch the VPN to TCP / port 443 mode (often called "
+            "“TCP”, “Stealth” or “OpenVPN TCP”).")
+    return _r(cid, title, Status.WARN, note, raw=stun.raw, udp_ok=False,
+              note=note)
+
+
+# --------------------------------------------------------------------------
 # 6. Internet (IP level, no DNS)
 # --------------------------------------------------------------------------
 
@@ -367,25 +505,42 @@ def check_internet(ctx: Ctx) -> CheckResult:
             reasons.append(why)
             lines.append(f"{name} {ip}:443 — {why}")
     up = net.uplink(ctx)
-    v6_note = ""
+    v4 = f"IPv4 {len(ok_rtts)}/{len(net.INTERNET_ANCHORS)}"
+    v6_state = "not available on this network"
+    rtt6 = None
     if up.v6_dev:
         rtt6, why6 = net.tcp_connect("2606:4700:4700::1111", 443, 3.0,
                                      socket.AF_INET6)
-        lines.append("Cloudflare IPv6 :443 — "
+        rtt6b, _ = (None, "") if rtt6 is not None else net.tcp_connect(
+            "2001:4860:4860::8888", 443, 3.0, socket.AF_INET6)
+        rtt6 = rtt6 if rtt6 is not None else rtt6b
+        lines.append("IPv6 Cloudflare/Google :443 — "
                      + (net.fmt_ms(rtt6) if rtt6 is not None else why6))
-        if rtt6 is None and ok_rtts:
-            v6_note = "IPv6 is configured but does not work"
+        v6_state = "works" if rtt6 is not None else "configured but broken"
     raw = "\n".join(lines)
+    m = {"ipv4_ok": bool(ok_rtts), "ipv6": v6_state}
     if ok_rtts:
         best = min(ok_rtts)
-        summary = (f"Internet servers are reachable ({len(ok_rtts)}/"
-                   f"{len(net.INTERNET_ANCHORS)}, {net.fmt_ms(best)}).")
-        if v6_note:
-            return _r(cid, title, Status.WARN, summary + f" {v6_note}.",
+        summary = (f"Internet servers are reachable — IPv4: works "
+                   f"({len(ok_rtts)}/{len(net.INTERNET_ANCHORS)}, "
+                   f"{net.fmt_ms(best)}); IPv6: {v6_state}.")
+        if v6_state == "configured but broken":
+            m["headline"] = ("Internet works, but IPv6 is broken — some "
+                             "sites may load slowly.")
+            return _r(cid, title, Status.WARN, summary,
                       "Broken IPv6 makes some sites load slowly or not at "
-                      "all. Ask the ISP, or disable IPv6 in the connection "
-                      "settings (IPv6 → Disabled).", raw, rtt_ms=best)
-        return _r(cid, title, Status.PASS, summary, raw=raw, rtt_ms=best)
+                      "all, because apps try IPv6 first and wait. Ask the "
+                      "network/ISP, or disable IPv6 for this connection "
+                      "(Settings → Network → IPv6 → Disable).", raw,
+                      rtt_ms=best, **m)
+        return _r(cid, title, Status.PASS, summary, raw=raw, rtt_ms=best,
+                  **m)
+    if rtt6 is not None:
+        return _r(cid, title, Status.WARN,
+                  f"Only IPv6 works ({v4} failed). Sites without IPv6 will "
+                  "not open.",
+                  "The network gives no working IPv4 internet: reconnect; "
+                  "if it persists, ask the network operator.", raw, **m)
     proxy = net.proxy_env()
     if proxy:
         return _r(cid, title, Status.WARN,
@@ -394,6 +549,27 @@ def check_internet(ctx: Ctx) -> CheckResult:
                                               proxy.items()) + ").",
                   "Normal for corporate networks. Apps that ignore the "
                   "proxy will not work.", raw)
+    vpn = net.vpn_uplink(ctx)
+    if vpn is not None:
+        pres = portal.detect(ctx)
+        m["confidence"] = "confirmed"
+        page = (f" The local router's page {pres.gateway_page} answers — "
+                "if this is a hotel/café network, its login page may be "
+                "what blocks the VPN." if pres.gateway_page else "")
+        return _r(cid, title, Status.FAIL,
+                  f"The VPN ({vpn.name}) is on, but nothing passes through "
+                  "the tunnel — the VPN server is unreachable from this "
+                  "network." + page,
+                  "Turn the VPN off (VPN app, network menu, or `nmcli "
+                  "connection down <vpn>` / `sudo wg-quick down "
+                  f"{vpn.name}`) and run the check again. If the internet "
+                  "works without it: sign in on the network's login page "
+                  "first, then connect the VPN; if it still fails, the "
+                  "network blocks VPNs — run this check with the VPN off: "
+                  "the “UDP traffic” step shows whether UDP is blocked, in "
+                  "which case switch the VPN to TCP / port 443 (“Stealth”) "
+                  "mode or another server/protocol.",
+                  raw, vpn=vpn.name, login_url=pres.gateway_page, **m)
     if any("unreachable" in r.lower() for r in reasons):
         why = "the system has no usable route"
     else:
@@ -477,12 +653,75 @@ def check_dns(ctx: Ctx) -> CheckResult:
                   "cannot resolve names.",
                   "Check the `hosts:` line in /etc/nsswitch.conf and any "
                   "firewall/VPN that filters DNS for applications.", raw)
+    gw = net.local_gateway(ctx)
+    router = net.dns_query(gw, "example.com") if gw and ":" not in gw \
+        and gw not in servers else None
+    if router is not None and router.ok:
+        dot = ""
+        if ctx.which("resolvectl"):
+            st = ctx.run(["resolvectl", "status"], timeout=5.0)
+            if "+DNSOverTLS" in st.text:
+                dot = " DNS-over-TLS is enabled in systemd-resolved."
+        return _r(cid, title, Status.FAIL,
+                  f"Your DNS ({srv}) is blocked by this network, but the "
+                  f"router's own DNS ({gw}) answers.{dot} Hotel/café "
+                  "networks often allow only their DNS.",
+                  "Switch DNS to Automatic for this Wi-Fi: Settings → "
+                  "Wi-Fi → (gear) → IPv4/IPv6 → DNS Automatic on (or "
+                  "`nmcli connection modify <wifi> ipv4.ignore-auto-dns no "
+                  "ipv4.dns \"\"`)"
+                  + (", and disable DNS-over-TLS (`DNSOverTLS=no` in "
+                     "/etc/systemd/resolved.conf, then `sudo systemctl "
+                     "restart systemd-resolved`)" if dot else "")
+                  + ". Reconnect afterwards.", raw)
     return _r(cid, title, Status.FAIL,
               "No DNS server answers, not even public ones — DNS traffic "
               "(port 53) is blocked.",
               "A firewall/router blocks DNS. Check firewall rules (`sudo "
               "ufw status`), or the router's parental-control settings.",
               raw)
+
+
+# --------------------------------------------------------------------------
+# 7b. System clock (wrong time breaks HTTPS certificates)
+# --------------------------------------------------------------------------
+
+def check_clock(ctx: Ctx) -> CheckResult:
+    cid, title = "conn.clock", "System clock"
+    info = clock.measure(ctx)
+    tz = info.timezone or "unknown zone"
+    auto = {True: "automatic time on", False: "automatic time OFF",
+            None: "automatic time: unknown"}[info.ntp]
+    m = {"clock_skew_s": info.skew_s, "timezone": info.timezone}
+    if info.wrong:
+        hint = ""
+        if abs(abs(info.skew_s) % 3600) < 300 or \
+                abs(abs(info.skew_s) % 3600 - 3600) < 300:
+            hint = (" A whole-hour error usually means the clock was moved "
+                    "by hand to the new local time instead of changing the "
+                    "time zone.")
+        return _r(cid, title, Status.FAIL,
+                  f"The system clock is {clock.fmt_skew(info.skew_s)} "
+                  f"(time zone {tz}, {auto}). HTTPS certificates are "
+                  "rejected when the clock is wrong, so secure sites fail."
+                  + hint, clock.fix_steps(info), info.raw, **m)
+    if info.skew_s is None:
+        if info.ntp is False:
+            return _r(cid, title, Status.WARN,
+                      f"Could not compare with real time; automatic time "
+                      f"is OFF (time zone {tz}).",
+                      clock.fix_steps(info), info.raw, **m)
+        return _r(cid, title, Status.SKIP,
+                  "Could not compare the clock with real time (no web "
+                  "server answered).", raw=info.raw, **m)
+    if info.local_rtc:
+        return _r(cid, title, Status.WARN,
+                  f"Clock is correct now, but the hardware clock keeps local "
+                  f"time — it will jump after reboots or zone changes "
+                  f"(zone {tz}).", clock.fix_steps(info), info.raw, **m)
+    return _r(cid, title, Status.PASS,
+              f"Clock is correct (±{abs(info.skew_s):.0f} s), zone {tz}, "
+              f"{auto}.", raw=info.raw, **m)
 
 
 # --------------------------------------------------------------------------
@@ -518,13 +757,18 @@ def _fetch(url: str, timeout: float = 6.0):
 def check_web(ctx: Ctx) -> CheckResult:
     cid, title = "conn.web", "Websites (HTTP/HTTPS)"
     lines = []
-    code, headers, body, err = _fetch("http://connectivity-check.ubuntu.com/")
-    lines.append(f"GET http://connectivity-check.ubuntu.com/ → {code or err}")
-    captive = False
-    if code is not None and code != 204:
-        captive = True
-        loc = headers.get("Location") or headers.get("location") or ""
-        lines.append(f"  unexpected answer (expected 204) {loc}")
+    pres = portal.detect(ctx)
+    if pres.state == "portal":
+        return _r(cid, title, Status.FAIL,
+                  "Websites are held back by the network's login page.",
+                  portal.login_hint(pres), pres.raw,
+                  login_url=pres.login_url)
+    http_ok = [p for p in pres.probes if p.outcome == "ok"]
+    code = 204 if http_ok else None
+    err = "" if http_ok else (pres.probes[0].detail if pres.probes
+                              else "no answer")
+    lines.append("plain HTTP: " + (f"OK via {http_ok[0].name}" if http_ok
+                                   else err))
     code2, headers2, body2, err2 = _fetch(
         "https://www.cloudflare.com/cdn-cgi/trace")
     lines.append(f"GET https://www.cloudflare.com/cdn-cgi/trace → "
@@ -537,31 +781,35 @@ def check_web(ctx: Ctx) -> CheckResult:
                 info[k] = v
         lines.append("  " + ", ".join(f"{k}={info[k]}" for k in
                                        ("ip", "loc", "colo") if k in info))
-    clock_note = ""
-    date_hdr = headers2.get("Date") or headers2.get("date")
-    if date_hdr:
-        try:
-            server_time = email.utils.parsedate_to_datetime(date_hdr)
-            skew = (datetime.datetime.now(datetime.timezone.utc)
-                    - server_time).total_seconds()
-            lines.append(f"  clock skew vs server: {skew:+.0f} s")
-            if abs(skew) > 300:
-                clock_note = (f"Your system clock is off by "
-                              f"{abs(skew) / 60:.0f} minutes. ")
-        except (TypeError, ValueError):
-            pass
+    cinfo = clock.measure(ctx)
+    clock_note = (f"Your system clock is {clock.fmt_skew(cinfo.skew_s)}. "
+                  if cinfo.wrong else "")
+    region = _region_note(ctx, info.get("loc", ""), cinfo.timezone)
+    if region:
+        lines.append("  " + region)
     raw = "\n".join(lines)
     ip_note = ""
     if info.get("ip"):
         ip_note = f" Public IP {info['ip']}" + (
             f" ({info['loc']})" if info.get("loc") else "") + "."
-    if captive and code2 != 200:
-        return _r(cid, title, Status.FAIL,
-                  "This network requires a login page (captive portal: "
-                  "hotel/café/office Wi-Fi).",
-                  "Open any http:// site in the browser (e.g. "
-                  "http://neverssl.com) and sign in on the page that "
-                  "appears.", raw)
+    dest = _destinations() if code2 == 200 else []
+    blocked = [n for n, ok, _ in dest if not ok]
+    for n, ok, why in dest:
+        lines.append(f"  {n}: {'OK' if ok else why}")
+    raw = "\n".join(lines)
+    if code2 == 200 and blocked and len(blocked) < len(dest):
+        return _r(cid, title, Status.WARN,
+                  f"The internet is only partly available: "
+                  f"{', '.join(blocked)} do not open, the other "
+                  f"{len(dest) - len(blocked)} test sites do." + ip_note,
+                  "These services are blocked by the network or in this "
+                  "country, or are down right now. Check one on the “Site "
+                  "doesn't open” tab; a VPN may help if it is a regional "
+                  "block.", raw, public_ip=info.get("ip"),
+                  location=info.get("loc"), region_note=region,
+                  confidence="likely",
+                  headline="Internet works, but some services are "
+                  "blocked.")
     if code2 == 200:
         if clock_note:
             return _r(cid, title, Status.WARN,
@@ -572,14 +820,22 @@ def check_web(ctx: Ctx) -> CheckResult:
                       public_ip=info.get("ip"))
         return _r(cid, title, Status.PASS,
                   "Websites open over HTTP and HTTPS." + ip_note, raw=raw,
-                  public_ip=info.get("ip"), location=info.get("loc"))
+                  public_ip=info.get("ip"), location=info.get("loc"),
+                  region_note=region)
     if err2.startswith("certificate"):
+        if cinfo.wrong:
+            return _r(cid, title, Status.FAIL,
+                      "HTTPS fails certificate checks because the system "
+                      f"clock is {clock.fmt_skew(cinfo.skew_s)} (" + err2 +
+                      ").", clock.fix_steps(cinfo), raw)
         return _r(cid, title, Status.FAIL,
                   "HTTPS connections fail certificate checks (" + err2 +
-                  "). " + clock_note,
-                  "Either the system clock is wrong (enable automatic time) "
-                  "or something intercepts HTTPS — antivirus, corporate "
-                  "proxy or a captive portal.", raw)
+                  "), although the clock is "
+                  + ("correct" if cinfo.skew_s is not None else
+                     "not verifiable") + ".",
+                  "Something intercepts HTTPS — antivirus web protection, "
+                  "a corporate proxy or the network itself. Check those; "
+                  "on a work network ask IT.", raw)
     if code == 204:
         return _r(cid, title, Status.WARN,
                   f"Plain HTTP works but HTTPS does not ({err2}).",
@@ -603,8 +859,12 @@ def make_checks(ctx: Ctx | None = None) -> list[Check]:
         Check("conn.ip", "IP address", check_ip),
         Check("conn.route", "Route to the internet", check_route),
         Check("conn.gateway", "Router (gateway)", check_gateway),
+        Check("conn.portal", "Login page (captive portal)", check_portal),
+        Check("conn.security", "Network security", check_security),
+        Check("conn.udp", "UDP traffic (calls, VPN)", check_udp),
         Check("conn.internet", "Internet reachability", check_internet),
         Check("conn.dns", "Name resolution (DNS)", check_dns),
+        Check("conn.clock", "System clock", check_clock),
         Check("conn.web", "Websites (HTTP/HTTPS)", check_web),
     ]
 
@@ -628,6 +888,13 @@ def overview(ctx: Ctx) -> dict:
             w = net.wifi_link(ctx, via.name)
             if w["ssid"]:
                 out["network"] = w["ssid"]
+            d = net.wifi_details(ctx, via.name)
+            if d.get("security"):
+                out["security"] = ("open (no password)"
+                                   if net.wifi_is_open(d) else d["security"])
+        hs = net.hotspot_info(ctx)
+        if hs:
+            out["type"] = f"{out['type']} · {hs}"
         elif via.kind == "ethernet" and via.speed_mbps:
             out["network"] = f"{via.speed_mbps} Mbit/s"
     if itf is not None and itf.kind == "vpn":
@@ -640,8 +907,67 @@ def overview(ctx: Ctx) -> dict:
     return out
 
 
+_DESTINATIONS = (("Google", "https://www.google.com/generate_204"),
+                 ("Microsoft", "https://www.microsoft.com/"),
+                 ("Apple", "https://www.apple.com/"),
+                 ("Wikipedia", "https://www.wikipedia.org/"),
+                 ("GitHub", "https://github.com/"),
+                 ("YouTube", "https://www.youtube.com/"))
+
+
+def _destinations() -> list[tuple[str, bool, str]]:
+    """Independent HTTPS sites in parallel: (name, reachable, reason)."""
+    def one(item):
+        name, url = item
+        code, _h, _b, err = _fetch(url, timeout=6.0)
+        return name, code is not None, err or ""
+    with ThreadPoolExecutor(max_workers=len(_DESTINATIONS)) as pool:
+        return list(pool.map(one, _DESTINATIONS))
+
+
+def _region_note(ctx: Ctx, loc: str, tz: str) -> str:
+    """Compare where traffic exits (IP country) with the time zone."""
+    tzc = clock.tz_country(tz)
+    loc = (loc or "").upper()
+    if not loc or not tzc or loc == tzc or loc in ("XX", "T1"):
+        return ""
+    vpn = net.vpn_uplink(ctx)
+    if vpn is not None:
+        return (f"Your traffic exits in {loc} through the VPN {vpn.name}, "
+                f"while the time zone is {tz} ({tzc}). If you did not mean "
+                "to use the VPN here, turn it off.")
+    return (f"Your public IP is in {loc}, but the time zone is still {tz} "
+            f"({tzc}). If you have travelled, set the new time zone "
+            "(Settings → Date & Time). A proxy or a VPN app in the browser "
+            "can also cause this.")
+
+
+def _login_link(results: list[CheckResult]) -> tuple[str, str] | None:
+    for r in results:
+        url = r.metrics.get("login_url")
+        if url and r.status is Status.FAIL:
+            return ("Open login page", url)
+    return None
+
+
+# Failures whose *cause* is an inference rather than a direct measurement.
+_INFERRED = {"conn.internet", "conn.web"}
+
+
 def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
     steps, broken, degraded = chain_verdict(results, CHAIN)
+    notes = collect_notes(results)
+    region = next((r.metrics.get("region_note") for r in results
+                   if r.metrics.get("region_note")), "")
+    if region and region not in notes:
+        notes.append(region)
+    hotspot = net.hotspot_info(ctx) if ctx is not None else ""
+
+    def done(v: Verdict, cause=None) -> Verdict:
+        v.confidence = chain_confidence(steps, cause, _INFERRED)
+        v.notes = notes
+        return v
+
     if broken is not None and broken.check is not None:
         c = broken.check
         later = [s.label for s in steps[steps.index(broken) + 1:]
@@ -651,22 +977,51 @@ def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
             detail += (" Because of this, the later steps fail too ("
                        + ", ".join(later) + ") — they are not separate "
                        "problems.")
-        return Verdict("fail", f"No internet: problem at “{broken.label}”.",
-                       detail, [c.suggestion] if c.suggestion else [],
-                       steps, c.check_id)
+        actions = [c.suggestion] if c.suggestion else []
+        if hotspot and c.check_id in ("conn.ip", "conn.route",
+                                      "conn.internet", "conn.dns") and \
+                not c.metrics.get("vpn"):
+            tips = net.hotspot_tips(hotspot, "offline")
+            if c.check_id == "conn.internet":
+                # "Reboot the router / call the ISP" does not apply to a phone.
+                return done(Verdict(
+                    "fail", "No internet: the phone's mobile connection is "
+                    "not passing traffic.", detail, [tips], steps,
+                    c.check_id), broken)
+            actions.append(tips)
+        if c.check_id == "conn.internet" and c.metrics.get("vpn"):
+            url = c.metrics.get("login_url")
+            return done(Verdict(
+                "fail", "The VPN is on but is not working on this network.",
+                detail, actions, steps, c.check_id,
+                ("Open router page", url) if url else None), broken)
+        if c.check_id == "conn.clock":
+            return done(Verdict(
+                "fail", "The system clock is wrong — secure sites fail.",
+                detail, actions, steps, c.check_id), broken)
+        login = _login_link(results)
+        if login:
+            return done(Verdict("fail", "You need to sign in to this "
+                                "network.", detail, actions, steps,
+                                c.check_id, login), broken)
+        return done(Verdict("fail", f"No internet: problem at "
+                            f"“{broken.label}”.", detail, actions, steps,
+                            c.check_id), broken)
     if degraded is not None and degraded.check is not None:
         c = degraded.check
-        return Verdict("warn", "Internet works, but there is a problem at "
-                       f"“{degraded.label}”.", c.summary,
-                       [c.suggestion] if c.suggestion else [], steps,
-                       c.check_id)
-    if all(s.status is Status.PASS for s in steps):
-        web = next((s.check for s in steps if s.step_id == "conn.web"), None)
-        return Verdict("ok", "Internet connection works.",
-                       "Every step from the adapter to websites is fine. If "
-                       "it is slow, use the Speed tab; if one site does not "
-                       "open, check it on the Website tab."
-                       + (" " + web.summary.split(". ", 1)[-1]
-                          if web and "Public IP" in web.summary else ""),
-                       [], steps)
-    return Verdict("unknown", "Could not finish the check.", "", [], steps)
+        return done(Verdict("warn", c.metrics.get("headline") or
+                            "Internet works, but there is a problem at "
+                            f"“{degraded.label}”.", c.summary,
+                            [c.suggestion] if c.suggestion else [], steps,
+                            c.check_id), degraded)
+    if all(s.status in (Status.PASS, Status.SKIP) for s in steps) and \
+            any(s.status is Status.PASS for s in steps):
+        detail = ("Every step from the adapter to websites works. If it "
+                  "is slow, use the “Slow internet” tab; if one site does "
+                  "not open, check it on the “Site doesn't open” tab.")
+        if hotspot:
+            detail += f" Connected through a {hotspot}."
+        return done(Verdict("ok", "Internet connection works.", detail, [],
+                            steps))
+    return done(Verdict("unknown", "Could not finish the check.", "", [],
+                        steps))

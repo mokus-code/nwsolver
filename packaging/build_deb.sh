@@ -33,15 +33,35 @@ mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/usr/share/applications" \
          "$STAGE/usr/share/doc/nwsolver"
 
-# ---- 1. bundled PySide6 (pip --target, no build-time compile) ------------
-echo ">> fetching PySide6-Essentials from PyPI (network required)…"
-"$PROJECT_DIR/.venv/bin/python" -m pip install --quiet \
-    --target "$STAGE/usr/lib/nwsolver/pyside" \
-    --only-binary :all: --no-cache-dir \
-    "PySide6-Essentials>=6.6"
-find "$STAGE/usr/lib/nwsolver/pyside" -name '__pycache__' -type d -prune \
-     -exec rm -rf {} +
-find "$STAGE/usr/lib/nwsolver/pyside" -name '*.pyc' -delete
+# ---- 1. bundled PySide6 (downloaded once, then reused) -------------------
+# PySide6 is fetched from PyPI only on the first build and kept unpacked in
+# dist/cache/pyside. Later builds just copy it. Force a fresh download with:
+#     REFRESH_PYSIDE=1 ./packaging/build_deb.sh
+CACHE_DIR="$DIST_DIR/cache"
+WHEELS="$CACHE_DIR/wheels"
+PYSIDE_CACHE="$CACHE_DIR/pyside"
+PIP="$PROJECT_DIR/.venv/bin/python -m pip"
+if [ "${REFRESH_PYSIDE:-0}" = "1" ]; then
+    rm -rf "$CACHE_DIR"
+fi
+if [ ! -d "$PYSIDE_CACHE" ]; then
+    if ! ls "$WHEELS"/*.whl >/dev/null 2>&1; then
+        echo ">> downloading PySide6-Essentials from PyPI (first build only)…"
+        mkdir -p "$WHEELS"
+        $PIP download --quiet --only-binary :all: --dest "$WHEELS" \
+            "PySide6-Essentials>=6.6"
+    fi
+    echo ">> unpacking PySide6 into the build cache…"
+    rm -rf "$PYSIDE_CACHE.tmp"
+    $PIP install --quiet --no-index --find-links "$WHEELS" \
+        --target "$PYSIDE_CACHE.tmp" "PySide6-Essentials>=6.6"
+    find "$PYSIDE_CACHE.tmp" -name '__pycache__' -type d -prune \
+         -exec rm -rf {} +
+    find "$PYSIDE_CACHE.tmp" -name '*.pyc' -delete
+    mv "$PYSIDE_CACHE.tmp" "$PYSIDE_CACHE"
+fi
+echo ">> using cached PySide6: $(ls "$WHEELS" | tr '\n' ' ')"
+cp -a "$PYSIDE_CACHE" "$STAGE/usr/lib/nwsolver/pyside"
 
 # ---- 2. app payload ------------------------------------------------------
 mkdir -p "$STAGE/usr/lib/nwsolver/nwsolver"

@@ -26,6 +26,7 @@ class SuitePage(QWidget):
     suite = None
     idle_text = ""
     button_text = "Run"
+    tiles_are_details = False   # True: fact tiles go under "Show details"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -50,6 +51,17 @@ class SuitePage(QWidget):
         self.results.raw_requested.connect(self.raw_requested)
         self.results.ai_requested.connect(self.ai_requested)
 
+        # Progressive disclosure: only the verdict is shown by default;
+        # the individual steps (and technical facts) are one click away.
+        self.details_btn = QPushButton("Show details")
+        self.details_btn.setCheckable(True)
+        self.details_btn.toggled.connect(self._toggle_details)
+        self.details_btn.hide()
+        self.details_box = QWidget()
+        dlay = QVBoxLayout(self.details_box)
+        dlay.setContentsMargins(0, 0, 0, 0)
+        dlay.setSpacing(10)
+
         content = QWidget()
         lay = QVBoxLayout(content)
         lay.setContentsMargins(14, 12, 14, 14)
@@ -58,9 +70,18 @@ class SuitePage(QWidget):
         lay.addLayout(self.controls)
         lay.addWidget(self.note)
         self.build_extra(lay)
-        lay.addWidget(self.tiles)
-        lay.addWidget(self.steps_title)
-        lay.addWidget(self.results)
+        if self.tiles_are_details:
+            dlay.addWidget(self.tiles)
+        else:
+            lay.addWidget(self.tiles)
+        details_row = QHBoxLayout()
+        details_row.addWidget(self.details_btn)
+        details_row.addStretch(1)
+        lay.addLayout(details_row)
+        dlay.addWidget(self.steps_title)
+        dlay.addWidget(self.results)
+        lay.addWidget(self.details_box)
+        self.details_box.hide()
         lay.addStretch(1)
 
         scroll = QScrollArea()
@@ -73,6 +94,10 @@ class SuitePage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(scroll)
         self.steps_title.hide()
+
+    def _toggle_details(self, shown: bool):
+        self.details_box.setVisible(shown)
+        self.details_btn.setText("Hide details" if shown else "Show details")
 
     # -- hooks for subclasses ---------------------------------------------
 
@@ -110,6 +135,7 @@ class SuitePage(QWidget):
         titles = [c.title for c in self.suite.make_checks(None)]
         self.results.reset(titles)
         self.steps_title.show()
+        self.details_btn.show()
         self.banner.set_busy(self.busy_text())
         chain = getattr(self.suite, "CHAIN", None)
         self.banner.set_progress_steps([lbl for _c, lbl in chain]
@@ -141,6 +167,7 @@ class SuitePage(QWidget):
 
 class ConnectionPage(SuitePage):
     suite = connection
+    tiles_are_details = True
     idle_text = "Check why there is no internet connection."
     button_text = "Check connection"
 
@@ -165,6 +192,8 @@ class ConnectionPage(SuitePage):
                  ("ip", "Your IP", v(ov.get("ip"))),
                  ("gw", "Router", v(ov.get("gateway"))),
                  ("dns", "DNS", v(ov.get("dns")))]
+        if ov.get("security"):
+            items.append(("sec", "Wi-Fi security", ov["security"]))
         if ov.get("vpn"):
             items.append(("vpn", "VPN", ov["vpn"]))
         if ov.get("proxy"):
@@ -196,7 +225,7 @@ class SpeedPage(SuitePage):
     _TILES = [("down", "Download"), ("up", "Upload"),
               ("ping", "Latency (idle)"), ("loaded", "Latency under load"),
               ("lan", "To router"), ("loss", "Loss (internet)"),
-              ("link", "Wi-Fi / cable")]
+              ("link", "Wi-Fi / cable"), ("calls", "Video calls")]
 
     def build_controls(self, row):
         super().build_controls(row)
@@ -294,6 +323,9 @@ class SpeedPage(SuitePage):
         elif m.get("link_mbps"):
             link = f"{m['link_mbps']} Mbit/s"
         put("link", link)
+        put("calls", {"good": "Good (HD)", "fair": "OK, with limits",
+                      "bad": "Poor"}.get(m.get("calls")) if m.get("calls")
+            else None)
 
 
 # --------------------------------------------------------------------------

@@ -19,8 +19,8 @@ import threading
 import time
 import urllib.parse
 
-from nwsolver.diag import net
-from nwsolver.diag.verdict import Verdict
+from nwsolver.diag import net, portal
+from nwsolver.diag.verdict import Verdict, collect_notes
 from nwsolver.engine.checks import Check, CheckResult, Ctx, Status
 
 SUITE_ID = "speed"
@@ -51,6 +51,23 @@ def _uplink_iface(ctx: Ctx) -> net.Iface | None:
 
 
 # --------------------------------------------------------------------------
+# 0. Login page gate — measuring behind a captive portal is meaningless
+# --------------------------------------------------------------------------
+
+def check_portal(ctx: Ctx) -> CheckResult:
+    cid, title = "speed.portal", "Network login page"
+    res = portal.detect(ctx)
+    if res.state == "portal":
+        ctx.state["abort"] = True
+        return _r(cid, title, Status.FAIL,
+                  "This network requires signing in on a login page first — "
+                  "until then speed can't be measured.",
+                  portal.login_hint(res), res.raw, login_url=res.login_url)
+    return _r(cid, title, Status.PASS, "No login page required.",
+              raw=res.raw)
+
+
+# --------------------------------------------------------------------------
 # 1. Local link capacity
 # --------------------------------------------------------------------------
 
@@ -74,9 +91,18 @@ def check_link(ctx: Ctx) -> CheckResult:
             bits.append(f"link rate {net.fmt_mbps(rate)}")
         if w["power_save"]:
             bits.append("power saving on")
+        d = net.wifi_details(ctx, itf.name)
+        if d.get("channel"):
+            bits.append(f"channel {d['channel']}"
+                        + (f", {d['width']} MHz wide" if d.get("width")
+                           else ""))
         summary = ", ".join(bits) + "."
         m = {"kind": "wifi", "signal": sig, "link_mbps": rate,
-             "band": band, "power_save": w["power_save"]}
+             "band": band, "power_save": w["power_save"],
+             "channel": d.get("channel"), "width": d.get("width")}
+        if d.get("width") == 20 and band and band != "2.4 GHz":
+            summary += (" The router uses a narrow 20 MHz channel on 5 GHz, "
+                        "which limits speed.")
         problems, fixes = [], []
         status = Status.PASS
         if sig is not None and sig < -75:
@@ -175,21 +201,21 @@ def check_background(ctx: Ctx) -> CheckResult:
 
 def check_lan(ctx: Ctx) -> CheckResult:
     cid, title = "speed.lan", "Local network quality (to the router)"
-    up = net.uplink(ctx)
-    if not up.gateway:
+    gw = net.local_gateway(ctx)
+    if not gw:
         return _r(cid, title, Status.SKIP,
                   "No router on this link (VPN/point-to-point) — skipped.")
-    st = net.latency(ctx, up.gateway, count=20, interval=0.2, tcp_port=80)
+    st = net.latency(ctx, gw, count=20, interval=0.2, tcp_port=80)
     ctx.state["lan"] = st
     m = {"rtt_ms": st.avg_ms, "loss_pct": st.loss_pct,
          "jitter_ms": st.jitter_ms}
     if not st.ok:
         return _r(cid, title, Status.SKIP,
-                  f"Router {up.gateway} does not answer ping — local "
+                  f"Router {gw} does not answer ping — local "
                   "quality could not be measured.", raw=st.raw, **m)
     itf = _uplink_iface(ctx)
     wifi = itf is not None and itf.kind == "wifi"
-    summary = (f"Router {up.gateway}: {net.fmt_ms(st.avg_ms)} average, "
+    summary = (f"Router {gw}: {net.fmt_ms(st.avg_ms)} average, "
                f"jitter {net.fmt_ms(st.jitter_ms)}, "
                f"{st.loss_pct:.0f}% loss.")
     lim_rtt = 30 if wifi else 5
@@ -234,6 +260,22 @@ def check_wan(ctx: Ctx) -> CheckResult:
                f"jitter {net.fmt_ms(st.jitter_ms)}, {st.loss_pct:.0f}% loss.")
     isp_loss = st.loss_pct - lan_loss
     isp_rtt = (st.avg_ms or 0) - lan_rtt
+    vpn = net.vpn_uplink(ctx)
+    if vpn is not None:
+        m["vpn"] = vpn.name
+        summary += f" Measured through the VPN ({vpn.name})."
+        if isp_loss >= 5 or isp_loss >= 1 or isp_rtt > 80 or \
+                (st.jitter_ms or 0) > 30:
+            return _r(cid, title,
+                      Status.FAIL if isp_loss >= 5 else Status.WARN,
+                      summary + " The delay/loss comes from the path through "
+                      "the VPN server, not necessarily from your ISP.",
+                      "Pick a VPN server close to where you are now (or turn "
+                      "the VPN off) and repeat the test to see your line's "
+                      "real quality.", st.raw, **m)
+        return _r(cid, title, Status.PASS,
+                  summary + " The path through the VPN is healthy.",
+                  raw=st.raw, **m)
     if isp_loss >= 5:
         return _r(cid, title, Status.FAIL,
                   summary + " Packets are lost beyond your router — on the "
@@ -249,6 +291,52 @@ def check_wan(ctx: Ctx) -> CheckResult:
                   st.raw, **m)
     return _r(cid, title, Status.PASS, summary + " The ISP path is healthy.",
               raw=st.raw, **m)
+
+
+# --------------------------------------------------------------------------
+# 4b. Packet size limit (MTU / PMTUD)
+# --------------------------------------------------------------------------
+
+def mtu_result(ctx: Ctx, cid: str, title: str, host: str) -> CheckResult:
+    """Shared by the speed and website suites."""
+    up = net.uplink(ctx)
+    itf = net.find_iface(ctx, up.dev)
+    if itf is None:
+        return _r(cid, title, Status.SKIP, "No active connection.")
+    try:
+        if_mtu = int((ctx.read(f"/sys/class/net/{itf.name}/mtu") or "0")
+                     .strip())
+    except ValueError:
+        if_mtu = 0
+    pmtu, why = net.path_mtu(ctx, host)
+    m = {"path_mtu": pmtu, "iface_mtu": if_mtu}
+    if pmtu is None:
+        return _r(cid, title, Status.SKIP,
+                  f"Could not measure the packet size limit ({why}).", **m)
+    summary = (f"Packets up to {pmtu} bytes get through to {host}; "
+               f"{itf.name} sends up to {if_mtu} bytes.")
+    if if_mtu and pmtu < if_mtu:
+        nm = net.nm_state(ctx)
+        conn = (nm.get("devices", {}).get(itf.name) or {}).get(
+            "connection") or "<connection>"
+        key = {"wifi": "802-11-wireless.mtu", "ethernet":
+               "802-3-ethernet.mtu"}.get(itf.kind)
+        how = (f"`nmcli connection modify \"{conn}\" {key} {pmtu}` and "
+               "reconnect" if key else
+               f"set MTU {pmtu} in the VPN settings")
+        return _r(cid, title, Status.WARN,
+                  summary + " Larger packets are dropped on the way, so "
+                  "some pages, downloads or the VPN can stall even though "
+                  "the connection is up. Common with VPNs, mobile networks "
+                  "and some hotel networks.",
+                  f"Lower the MTU to {pmtu}: {how}.", **m,
+                  confidence="likely")
+    return _r(cid, title, Status.PASS, summary + " No size problems.", **m)
+
+
+def check_mtu(ctx: Ctx) -> CheckResult:
+    return mtu_result(ctx, "speed.mtu", "Packet size limit (MTU)",
+                      LATENCY_HOST)
 
 
 # --------------------------------------------------------------------------
@@ -490,9 +578,12 @@ def check_download(ctx: Ctx) -> CheckResult:
                   "Check the Connection tab; a firewall or proxy may block "
                   "large downloads.", "\n".join(stats.get("errors", [])))
     mbps = stats["mbps"]
+    ctx.state["down_mbps"] = mbps
+    ctx.state["bloat_ms"] = None
     loaded = stats["loaded_ms"]
     bloat = (loaded - idle) if (loaded is not None and idle is not None) \
         else None
+    ctx.state["bloat_ms"] = bloat
     m = {"down_mbps": mbps, "idle_ms": idle, "loaded_ms": loaded,
          "bloat_ms": bloat, "retrans_pct": stats["retrans_pct"],
          "nic_errors": stats["nic_errors"]}
@@ -530,6 +621,7 @@ def check_upload(ctx: Ctx) -> CheckResult:
                   "Upload test server not reachable — skipped.",
                   raw="\n".join(stats.get("errors", [])))
     mbps = stats["mbps"]
+    ctx.state["up_mbps"] = mbps
     m = {"up_mbps": mbps, "retrans_pct": stats["retrans_pct"]}
     summary = f"{net.fmt_mbps(mbps)} upload."
     rt = stats["retrans_pct"]
@@ -541,6 +633,75 @@ def check_upload(ctx: Ctx) -> CheckResult:
                   "if the local network is fine, it is the ISP.",
                   _transfer_raw(stats), **m)
     return _r(cid, title, Status.PASS, summary, raw=_transfer_raw(stats), **m)
+
+
+# --------------------------------------------------------------------------
+# 7b. Video calls — derived from the measurements + a UDP (STUN) test
+# --------------------------------------------------------------------------
+
+def check_calls(ctx: Ctx) -> CheckResult:
+    cid, title = "speed.calls", "Video calls (Zoom, Teams, Meet)"
+    wan: net.PingStats | None = ctx.state.get("wan")
+    up = ctx.state.get("up_mbps")
+    down = ctx.state.get("down_mbps")
+    bloat = ctx.state.get("bloat_ms")
+    stun = net.stun_probe()
+    ctx.state["udp_ok"] = stun.ok
+    if wan is None or not wan.ok:
+        return _r(cid, title, Status.FAIL,
+                  "Calls will not work: there is no working internet path.",
+                  raw=stun.raw)
+    rtt, jit, loss = wan.avg_ms or 0, wan.jitter_ms or 0, wan.loss_pct
+    bad, meh = [], []
+    if rtt > 300:
+        bad.append(f"delay {net.fmt_ms(rtt)} (people will talk over each "
+                   "other)")
+    elif rtt > 150:
+        meh.append(f"noticeable delay {net.fmt_ms(rtt)}")
+    if jit > 50:
+        bad.append(f"jitter {net.fmt_ms(jit)} (choppy audio)")
+    elif jit > 30:
+        meh.append(f"jitter {net.fmt_ms(jit)}")
+    if loss >= 3:
+        bad.append(f"{loss:.0f}% packet loss (freezes, robotic voice)")
+    elif loss >= 1:
+        meh.append(f"{loss:.0f}% packet loss")
+    if up is not None:
+        if up < 1.2:
+            bad.append(f"upload only {net.fmt_mbps(up)} (others won't see "
+                       "your video)")
+        elif up < 3:
+            meh.append(f"upload {net.fmt_mbps(up)} — enough for SD video only")
+    if down is not None and down < 3:
+        meh.append(f"download {net.fmt_mbps(down)}")
+    if bloat is not None and bloat > 100:
+        meh.append("calls will stutter whenever something else downloads "
+                   "(bufferbloat)")
+    if not stun.ok:
+        meh.append("UDP is blocked, so calls fall back to slower TCP relays "
+                   "and VPNs like WireGuard won't connect")
+    m = {"calls": "bad" if bad else "fair" if meh else "good",
+         "udp_ok": stun.ok, "stun_rtt_ms": stun.rtt_ms}
+    raw = (f"latency {net.fmt_ms(rtt)}, jitter {net.fmt_ms(jit)}, loss "
+           f"{loss:.1f}%, upload {net.fmt_mbps(up)}, download "
+           f"{net.fmt_mbps(down)}, bloat {net.fmt_ms(bloat)}\n\n" + stun.raw)
+    if bad:
+        summary = "Video calls will work poorly: " + "; ".join(bad + meh) + "."
+        return _r(cid, title, Status.FAIL, summary,
+                  "Use audio only or turn your camera off; move closer to "
+                  "the router or use a cable; pause other downloads. If the "
+                  "delay comes from a VPN, turn it off for the call.", raw,
+                  note=summary, **m)
+    if meh:
+        summary = "Video calls will work, with limits: " + "; ".join(meh) + "."
+        return _r(cid, title, Status.WARN, summary,
+                  "Close other downloads during calls; lower the video "
+                  "quality if it freezes." + (" If you use a VPN, switch it "
+                  "to TCP / port 443 mode on this network." if not stun.ok
+                  else ""), raw, note=summary, **m)
+    summary = ("Good for HD video calls: low delay and jitter, no loss, UDP "
+               "works.")
+    return _r(cid, title, Status.PASS, summary, raw=raw, note=summary, **m)
 
 
 # --------------------------------------------------------------------------
@@ -615,13 +776,16 @@ def check_wifi_channels(ctx: Ctx) -> CheckResult:
 
 def make_checks(ctx: Ctx | None = None) -> list[Check]:
     return [
+        Check("speed.portal", "Network login page", check_portal),
         Check("speed.link", "Your connection to the router", check_link),
         Check("speed.background", "Other traffic right now", check_background),
         Check("speed.lan", "Local network quality (to the router)", check_lan),
         Check("speed.wan", "Internet path quality (ISP)", check_wan),
+        Check("speed.mtu", "Packet size limit (MTU)", check_mtu),
         Check("speed.dns", "DNS lookup speed", check_dns),
         Check("speed.download", "Download speed", check_download),
         Check("speed.upload", "Upload speed", check_upload),
+        Check("speed.calls", "Video calls (Zoom, Teams, Meet)", check_calls),
         Check("speed.wifi_channels", "Wi-Fi channel congestion",
               check_wifi_channels),
     ]
@@ -643,12 +807,14 @@ def metrics(results: list[CheckResult]) -> dict:
 
 
 _ORDER = ["speed.link", "speed.lan", "speed.wifi_channels", "speed.wan",
-          "speed.background", "speed.download", "speed.upload", "speed.dns"]
+          "speed.mtu", "speed.background", "speed.download", "speed.upload",
+          "speed.dns"]
 _PLACES = {
     "speed.link": "your Wi-Fi / cable",
     "speed.lan": "your home network",
     "speed.wifi_channels": "Wi-Fi interference",
     "speed.wan": "the ISP",
+    "speed.mtu": "a packet size limit (MTU)",
     "speed.background": "other traffic on this computer",
     "speed.download": "latency under load",
     "speed.upload": "upload losses",
@@ -657,6 +823,28 @@ _PLACES = {
 
 
 def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
+    v = _analyze(results, ctx)
+    v.notes = collect_notes(results)
+    hotspot = net.hotspot_info(ctx) if ctx is not None else ""
+    if hotspot and v.state in ("warn", "fail") and v.culprit not in (
+            "speed.portal", "speed.download"):
+        v.actions.append(net.hotspot_tips(hotspot, "slow"))
+    elif hotspot and v.state == "ok":
+        v.detail += f" Connected through a {hotspot}."
+    if not v.confidence:
+        main = next((r for r in results if r.check_id == v.culprit), None)
+        if v.state == "unknown":
+            v.confidence = "insufficient"
+        elif main is not None and main.metrics.get("confidence"):
+            v.confidence = main.metrics["confidence"]
+        elif main is not None and main.status is Status.WARN:
+            v.confidence = "likely"
+        else:
+            v.confidence = "confirmed"
+    return v
+
+
+def _analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
     by_id = {r.check_id: r for r in results}
     m = metrics(results)
     down, up = m.get("down_mbps"), m.get("up_mbps")
@@ -671,6 +859,12 @@ def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
             speed_txt += f"  ↑ {net.fmt_mbps(up)}"
     if not results:
         return Verdict("unknown", "No measurements yet.")
+    gate = by_id.get("speed.portal")
+    if gate is not None and gate.status is Status.FAIL:
+        return Verdict("fail", "Sign in to the network first.",
+                       gate.summary, [gate.suggestion], culprit=gate.check_id,
+                       link=("Open login page",
+                             gate.metrics.get("login_url", "")))
     if "speed.download" in by_id and \
             by_id["speed.download"].status is Status.FAIL:
         dl = by_id["speed.download"]
@@ -680,6 +874,8 @@ def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
     if bad:
         main = bad[0]
         place = _PLACES.get(main.check_id, main.title)
+        if main.check_id == "speed.wan" and main.metrics.get("vpn"):
+            place = f"the VPN ({main.metrics['vpn']})"
         headline = f"Slowed down by {place}."
         if speed_txt:
             headline = f"{speed_txt} — slowed down by {place}."
@@ -692,6 +888,10 @@ def analyze(results: list[CheckResult], ctx: Ctx | None = None) -> Verdict:
                        headline, detail, actions, culprit=main.check_id)
     link = m.get("link_mbps")
     detail = ("Your link, home network and the ISP path are healthy. ")
+    if m.get("vpn"):
+        detail = (f"Measured through the VPN ({m['vpn']}): the result is the "
+                  "speed of the VPN server path. Turn the VPN off to measure "
+                  "your own line. ")
     if down is not None and link and down < 0.3 * link and link >= 100:
         detail += (f"The measured speed is well below your link capacity "
                    f"({net.fmt_mbps(link)}), so the limit is your internet "
