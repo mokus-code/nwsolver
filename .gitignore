@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtualenv
+.venv/
+
+# Build output
+dist/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
