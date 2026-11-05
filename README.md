@@ -1,106 +1,67 @@
-# nwsolver — why doesn't the internet work *here*?
+# nwsolver — a friendly internet doctor for your Linux computer
 
-A desktop troubleshooter for Linux travelers. Hotel Wi-Fi says "connected" but
-nothing loads, the café network is painfully slow, the airline site won't open —
-nwsolver explains in plain words **what is broken**, **where**, and **what to
-do**, without terminal archaeology or guessing.
+**A small, friendly desktop app that tells you why the internet isn't working —
+and what to do about it — in plain words.**
 
-It answers three questions:
+It's made for everyday use, and especially for travel: hotel, café and airport
+Wi-Fi, coworking spaces, mobile hotspots.
 
-| Tab | Question it answers | What it does |
-|---|---|---|
-| **Connection** | Why is there no internet? | Walks the real path — adapter → link → IP address → route → router → internet → DNS → web — and names the **first broken step** as the cause. Later failures are shown as consequences, not as separate problems. Detects airplane mode, missing drivers, an unplugged cable, DHCP failure, a dead router, an ISP outage, broken DNS, hotel/café sign-in pages, a wrong clock, broken IPv6. |
-| **Speed** | Why is it so slow? | Measures each segment — Wi-Fi signal / cable speed, the local network (to the router), the provider's path — then real download/upload speed and latency under load. Names the bottleneck: weak Wi-Fi, a crowded channel, a 100 Mbit cable, packet loss at the provider, bufferbloat, background downloads, slow DNS. |
-| **Website** | Why doesn't *this* site open? | Checks one address step by step: `/etc/hosts`, DNS through your resolver *and* public DNS (to spot DNS blocking), TCP to every IPv4/IPv6 address, the TLS certificate, the HTTP answer, and where the route stops. Tells you whether it is your side, a block along the way, or the server. |
+## What it does
 
-Only interfaces that can actually carry internet traffic are inspected.
-Docker, libvirt, VirtualBox bridges, veths and similar are ignored — unless the
-system really routes internet traffic through them (a VPN does).
+Open it like any other app. Within a few seconds it explains one of three things:
 
-## When you're travelling
+- **"I have no internet."** It shows where the connection breaks — from your
+  Wi-Fi or cable, through your router and your provider, all the way to the
+  website — and points at the first thing that's wrong.
+- **"The internet is very slow."** It checks your Wi-Fi, your local network,
+  your provider and the real speed, then says what is slowing you down.
+- **"This website won't open."** It tells you whether the problem is on your
+  side, blocked somewhere along the way, or the site itself is down.
 
-- **Hotel / café / airport Wi-Fi with a sign-in page.** The Connection check
-  reaches the *Web* step and reports a captive portal instead of pretending
-  you're online — so you know to open the login page first.
-- **"Connected", but nothing loads.** The chain shows the first broken step:
-  no IP from DHCP, no default route, unreachable router, dead DNS…
-- **A VPN or proxy left over from the last country.** The app follows the
-  route the kernel actually uses, so a stale VPN tunnel is visible in the
-  chain, not hidden behind a "connected" Wi-Fi icon.
-- **Painfully slow hotel Wi-Fi.** The Speed check says whether the limit is
-  the Wi-Fi link, the hotel's local network, or the provider's uplink — and
-  suggests a less crowded channel where possible.
-- **One site won't open** (airline, booking, bank, streaming). The Website
-  check distinguishes a DNS block, a filtered port, TLS/SNI interception, an
-  HTTP 403/451, and a dead server.
-- **Wrong clock after crossing time zones.** Expired-looking certificates and
-  HTTPS failures are explained as clock skew.
+Every result comes with a short **"what to do"** hint.
 
-## Install
+## Perfect for travel
 
-Requires Ubuntu 22.04+ / Debian 12+ and Python 3.10+.
+- Hotel or café Wi-Fi that asks you to sign in — the app notices the login page
+  instead of pretending you're online.
+- Wi-Fi says "connected" but nothing loads — you see exactly which step fails.
+- A VPN or proxy left on from your last country.
+- Slow hotel Wi-Fi — it says whether the Wi-Fi, the hotel network or your
+  provider is to blame.
+- A booking, airline or bank site that won't open — it tells you why.
+- A wrong clock after changing time zones — it explains the strange security
+  warnings.
 
-### .deb package (recommended)
+## Install — three steps
 
-```sh
-./packaging/build_deb.sh            # builds dist/nwsolver_<version>_amd64.deb
-sudo apt install ./dist/nwsolver_0.2.0_amd64.deb
-nwsolver
-```
+1. **Download the installer** from the
+   [latest release](https://github.com/mokus-code/nwsolver/releases/latest)
+   (the file named `nwsolver_…_amd64.deb`).
+2. **Open the downloaded file.** Your software installer will offer to install
+   it — press **Install** and enter your password when asked.
+3. **Find nwsolver** in the application menu (search for "nwsolver") and open
+   it. That's it.
 
-The package bundles PySide6 (Ubuntu doesn't ship it) and depends on
-`iproute2`, `iputils-ping` and `iw`. `network-manager`, `iputils-tracepath`
-(or `traceroute`) and `pciutils` are recommended and add extra detail. It
-installs a menu entry, so you can also start it from the app grid.
-
-### From source (development)
+If you prefer the terminal, this one line does the same:
 
 ```sh
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-./start.sh
+sudo apt install ./nwsolver_0.2.0_amd64.deb
 ```
 
-## Terminal mode (no GUI)
+Works on Ubuntu, Linux Mint, Debian and most other modern Linux desktops.
 
-Useful over SSH, in a minimal install, or when the desktop itself is
-misbehaving:
+## Using it
 
-```sh
-./start.sh --selftest                      # why is there no internet?
-./start.sh --selftest --speed              # why is it slow?
-./start.sh --selftest --check example.com  # why doesn't this site open?
-```
+- The check starts by itself. Read the cards from top to bottom — the first red
+  one is usually the cause.
+- "Details" shows what was measured.
+- You can copy a short summary with one click and paste it into an AI chat or
+  send it to a friend who can help.
+- Wanting a second opinion? You can optionally connect your own AI assistant
+  in the Tools menu.
+- If the text is too small, use **View → Larger text**.
 
-## Using the app
+## Privacy
 
-- The connection check runs on start. Each step is a card: status, what was
-  found, and **→ what to do** when something is wrong.
-- **Details** on a card shows the raw command output; right-click a card to
-  copy it or ask the AI about it.
-- **Copy for AI** (Ctrl+Shift+C) / **Save for AI…** (Ctrl+E) — produces a short
-  text with what is wrong, the environment (OS, Wi-Fi/cable, IP, router, DNS,
-  VPN/proxy), the problems found with brief evidence, and a request for
-  step-by-step fix instructions. Paste it into any AI chat. Host name, MAC
-  and public IP are left out.
-- **Ask AI** (Ctrl+Shift+A) — optional; configure an OpenAI-compatible API or
-  a local Ollama in *Tools → AI assistant settings…*. Only the current tab's
-  results are sent.
-- **View → Larger / Smaller text** (Ctrl + / Ctrl − / Ctrl 0) scales the whole
-  UI; the window always fits the screen and nothing scrolls sideways.
-- **Run as root** — only adds detail (e.g. some Wi-Fi data); everything works
-  without it.
-
-## Notes
-
-- The speed test downloads from Cloudflare (fallbacks: OVH, Tele2) for about
-  8 s and uploads for about 6 s; it uses as much data as your connection
-  delivers in that time. Keep it in mind on metered mobile tethering.
-- Probes use plain IP addresses where possible, so they still work when DNS
-  is broken. ICMP is optional: if ping is blocked (common on public Wi-Fi),
-  TCP handshakes are used instead.
-- Nothing is sent anywhere unless you explicitly use the AI features; the
-  diagnostic engine itself is offline-only and standard-library Python. Only
-  the GUI needs PySide6.
-
-See [`docs/PLAN.md`](docs/PLAN.md) for the design and the full list of checks.
+Everything is checked on your own computer. Nothing is sent anywhere unless you
+choose to ask an AI assistant.
