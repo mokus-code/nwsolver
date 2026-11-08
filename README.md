@@ -39,7 +39,8 @@ It recognises the situations travellers run into most:
 
 ## Install
 
-1. Download the file `nwsolver_0.4.0_amd64.deb`.
+1. Download `nwsolver_0.4.0_amd64.deb` from the
+   [latest release](https://github.com/mokus-code/nwsolver/releases/latest).
 2. Double-click it and choose **Install** (in *Software* / *App Center*).
    You can also open a terminal in the download folder and run:
 
@@ -49,8 +50,10 @@ It recognises the situations travellers run into most:
 
 3. Open **nwsolver** from the applications menu.
 
-Works on Ubuntu 22.04 and newer (and similar systems such as Linux Mint,
-Pop!_OS, Debian 12+). No administrator password is needed to use it.
+Made for Ubuntu 22.04 and newer. It should also work on similar systems
+(Linux Mint, Pop!_OS, Debian 12+) — if it doesn't on yours, please
+[open an issue](https://github.com/mokus-code/nwsolver/issues). No
+administrator password is needed to use it.
 
 ## How to use it
 
@@ -110,12 +113,36 @@ want to show the provider that the connection dropped yesterday too.
 
 ## Privacy
 
-- Everything runs on your computer. The app only contacts well-known
-  public test servers (for example Cloudflare and Google) to check the
-  connection and measure speed.
-- Nothing is sent anywhere unless you copy or export it yourself.
+- Everything runs on your computer. There is no telemetry and no server
+  of our own. To check the connection, the app only contacts well-known
+  public addresses (full list below).
+- Your results are not sent anywhere unless you copy or export them
+  yourself, or press **Ask AI** (see below).
+- **Ask AI** is off until you set it up. When you use it, the report
+  (with the same hiding of addresses and names as the export) goes to the
+  provider you chose: an OpenAI-compatible service or a local Ollama. The
+  API key is stored in plain text in `~/.config/nwsolver/nwsolver.conf`.
+- Check history is kept in `~/.local/share/nwsolver/history`.
 - The app never changes your settings. It tells you what to change, and
   you decide.
+
+<details>
+<summary>Every address the app contacts</summary>
+
+| Purpose | Addresses |
+|---|---|
+| Internet reachability | `1.1.1.1` (Cloudflare), `8.8.8.8` (Google), `9.9.9.9` (Quad9) |
+| DNS checks | `1.1.1.1`, `8.8.8.8`; names looked up: `example.com`, `www.wikipedia.org`, `github.com`, a random `*.example.com` |
+| Hotel / café login page detection | `captive.apple.com`, `www.msftconnecttest.com`, `connectivitycheck.gstatic.com`, `www.google.com/generate_204`, `detectportal.firefox.com`, `connectivity-check.ubuntu.com`, `nmcheck.gnome.org` |
+| Clock check (time from HTTP `Date` header) | `www.google.com`, `captive.apple.com` |
+| “Do websites open” | `www.google.com`, `www.microsoft.com`, `www.apple.com`, `www.wikipedia.org`, `github.com`, `www.youtube.com` |
+| HTTPS check, public IP and country | `www.cloudflare.com/cdn-cgi/trace` |
+| Speed test | `speed.cloudflare.com`; fallbacks `proof.ovh.net`, `speedtest.tele2.net` |
+| UDP / video-call check (STUN) | `stun.l.google.com`, `stun.cloudflare.com`, `global.stun.twilio.com` |
+| Blocking checks for a site you type | that site, plus DNS-over-HTTPS at `1.1.1.1` and `8.8.8.8` and `example.com` as a control |
+| Ask AI (only if you set it up) | the provider address you entered |
+
+</details>
 
 ## Questions
 
@@ -148,3 +175,14 @@ AI provider: set it up in **Tools → AI assistant settings…**, then use
 - Design and the list of all checks: [docs/PLAN.md](docs/PLAN.md).
 - The diagnostic engine uses only the Python standard library; the window
   uses PySide6 (Qt). Licence of the bundled Qt: LGPL.
+
+## Licence
+
+nwsolver is released under the [MIT licence](LICENSE). The `.deb`
+bundles Qt for Python (PySide6), which is licensed under the LGPL.
+
+## How it was made
+
+nwsolver was written with heavy use of AI coding assistants. The idea,
+design, testing on real networks and decisions are mine. Bug reports and
+pull requests are welcome.
