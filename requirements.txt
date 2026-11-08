@@ -1,0 +1,2 @@
+# GUI toolkit. The diagnostic engine itself is stdlib-only.
+PySide6>=6.6
